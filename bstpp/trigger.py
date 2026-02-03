@@ -4,6 +4,8 @@ from scipy.stats import lomax
 import jax.numpy as jnp
 import numpy as np
 import jax
+import matplotlib.pyplot as plt
+
 
 
 class Trigger(ABC):
@@ -54,23 +56,22 @@ class Trigger(ABC):
         pass
     
     @abstractmethod
-    def compute_trigger(self,pars,mat):
+    def compute_trigger(self, pars, pairs_and_values):
         """
         Compute the trigger function. Computes the trigger function for the [n,n] difference matrix of points.
         Parameters
         ----------
         pars: dict
             results from sample_parameters
-        mat: jax numpy matrix
-            Difference matrix, whose shape is different for each kind of trigger.
-                 temporal triggers - [n, n]
-                 spatial triggers - [2, n, n]
-                 spatiotemporal triggers - [3, n, n]
+        pairs_and_values: tuple
+            tuple containing coords and values
         Returns
         -------
         jax numpy matrix [n,n]. Trigger function computed for each entry in the matrix
         """
-        pass
+        coords, values = pairs_and_values
+        trigger_vals = jnp.exp(-values / pars['beta']) / pars['beta']
+        return coords, trigger_vals
     
     @abstractmethod
     def compute_integral(self,pars,limits):
@@ -116,9 +117,10 @@ class Temporal_Power_Law(Trigger):
     def simulate_trigger(self,pars):
         return lomax.rvs(pars['beta'])*pars['gamma']
 
-    def compute_trigger(self,pars,mat):
-        #\beta * \gamma ^ \beta * (\gamma + t) ^ (- \beta - 1)
-        return pars['beta']/pars['gamma'] * (1 + mat/pars['gamma']) ** (-pars['beta'] - 1)
+    def compute_trigger(self, pars, pairs_and_values):
+        coords, values = pairs_and_values
+        trigger_vals = pars['beta']/pars['gamma'] * (1 + values/pars['gamma']) ** (-pars['beta'] - 1)
+        return coords, trigger_vals
 
     def compute_integral(self,pars,dif):
         return 1-(1+dif/pars['gamma'])**(-pars['beta'])
@@ -126,7 +128,90 @@ class Temporal_Power_Law(Trigger):
     def get_par_names(self):
         return ['beta','gamma']
 
+#------------------------------------------------    
+# Method 2: Event-based Simulation (Hawkes-like process)
+def simulate_hawkes_like_events(tpl, params, total_time=1500, baseline_rate=0.1):
+    """
+    Simulate a sequence of events where each event can trigger more events
+    """
+    # Convert parameters to scalars if they're arrays
+    params_scalar = {
+        'beta': float(params['beta']) if hasattr(params['beta'], 'item') else params['beta'],
+        'gamma': float(params['gamma']) if hasattr(params['gamma'], 'item') else params['gamma']
+    }
     
+    events = []
+    current_time = 0
+    
+    # Start with some initial events
+    np.random.seed(42)  # For reproducibility
+    
+    while current_time < total_time:
+        # Add baseline inter-arrival time (exponential)
+        baseline_wait = np.random.exponential(1/baseline_rate)
+        current_time += baseline_wait
+        
+        if current_time >= total_time:
+            break
+            
+        events.append(current_time)
+        
+        # Each event can trigger additional events with decreasing probability
+        n_triggered = np.random.poisson(0.5)  # Average 0.5 triggered events
+        
+        for _ in range(n_triggered):
+            # Use your temporal power law for triggered event timing
+            trigger_delay = tpl.simulate_trigger(params_scalar)
+            
+            # Cap the delay to reasonable values
+            trigger_delay = min(trigger_delay, 100)  # Max 100 days
+            
+            triggered_time = current_time + trigger_delay
+            if triggered_time < total_time:
+                events.append(triggered_time)
+    
+    # Sort events and calculate inter-arrival times
+    events = sorted(events)
+    inter_arrival_times = np.diff(events)
+    
+    return inter_arrival_times
+
+# Visualization function
+def plot_inter_arrival_distribution(inter_arrival_times, title="Frequency Distribution of Time Difference Between Events"):
+    """
+    Create a histogram similar to your reference plot
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Create histogram with appropriate bins
+    # Most values should be small (clustering) with long tail
+    max_time = min(1500, np.percentile(inter_arrival_times, 99))  # Limit to 99th percentile
+    bins = np.linspace(0, max_time, 50)
+    
+    counts, bins, patches = plt.hist(inter_arrival_times, 
+                                bins=bins, 
+                                alpha=0.7, 
+                                color='gray', 
+                                edgecolor='black')
+    
+    plt.xlabel('Time Difference (days)', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title(title, fontsize=14)
+    plt.grid(True, alpha=0.3)
+    
+    # Add some statistics
+    plt.text(0.7, 0.8, f'Total events: {len(inter_arrival_times)}\n'
+                    f'Mean interval: {np.mean(inter_arrival_times):.2f} days\n'
+                    f'Median interval: {np.median(inter_arrival_times):.2f} days', 
+            transform=plt.gca().transAxes, 
+            bbox=dict(boxstyle="round", facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return counts, bins
+
+#------------------------------------------------    
 
 class Temporal_Exponential(Trigger):
     r"""
@@ -139,8 +224,10 @@ class Temporal_Exponential(Trigger):
     def simulate_trigger(self, pars):
         return np.random.exponential(pars['beta'])
     
-    def compute_trigger(self,pars,mat):
-        return jnp.exp(-mat/pars['beta'])/pars['beta']
+    def compute_trigger(self, pars, pairs_and_values):
+        coords, values = pairs_and_values
+        trigger_vals = jnp.exp(-values / pars['beta']) / pars['beta']
+        return coords, trigger_vals
     
     def compute_integral(self,pars,dif):
         return 1-jnp.exp(-dif/pars['beta'])
@@ -160,9 +247,11 @@ class Spatial_Symmetric_Gaussian(Trigger):
     def simulate_trigger(self, pars):
         return np.random.normal(scale=pars['sigmax_2']**0.5,size=2)
     
-    def compute_trigger(self,pars,mat):
-        S_diff_sq=(mat[0]**2)/pars['sigmax_2']+(mat[1]**2)/pars['sigmax_2']
-        return jnp.exp(-0.5*S_diff_sq)/(2*jnp.pi*pars['sigmax_2'])
+    def compute_trigger(self, pars, pairs_and_dxdy):
+        coords, dx_vals, dy_vals = pairs_and_dxdy
+        S_diff_sq = (dx_vals**2 + dy_vals**2) / pars['sigmax_2']
+        trigger_vals = jnp.exp(-0.5 * S_diff_sq) / (2 * jnp.pi * pars['sigmax_2'])
+        return coords, trigger_vals
     
     def compute_integral(self,pars,dif):
         gaussianpart1 = 0.5*jax.scipy.special.erf(dif[0,0]/jnp.sqrt(2*pars['sigmax_2']))+\

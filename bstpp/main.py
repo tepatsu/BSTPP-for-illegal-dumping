@@ -7,10 +7,19 @@ import geopandas as gpd
 from shapely.geometry import Polygon
 import matplotlib.pyplot as plt
 from math import erf, ceil
-import warnings 
+import warnings
 import dill
 import pickle
 import pkgutil
+import math
+import matplotlib.dates as mdates
+import datetime
+import calendar
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+import matplotlib.gridspec as gridspec
+
 
 # JAX
 import jax.numpy as jnp
@@ -20,10 +29,11 @@ from numpyro.diagnostics import hpdi
 from jax.scipy.special import logsumexp
 from numpyro.infer import log_likelihood
 
-from .utils import * 
+from .utils import *
 from .inference_functions import *
 from .trigger import *
 from .vae_functions import *
+from .utils import aligned_difference_pairs
 
 
 def load_Boko_Haram():
@@ -62,9 +72,47 @@ def load_Chicago_Shootings():
             "covariates":cov, "boundaries":boundaries}
 
 
+def add_month_column(df, t_col='T', origin='2020-01-01'):
+    """
+    Adds a 'month' column (1-12) to the dataframe based on the time column.
+    Assumes 'T' is in days since origin.
+    """
+    df = df.copy()
+    df['month'] = pd.to_datetime(df[t_col], unit='D', origin=origin).dt.month
+    return df
+
+
+def add_month_grid_and_labels(ax, start_date, num_days,label_every_n_months=3):
+    # Ensure we are working with pandas Timestamp
+    start_date = pd.Timestamp(start_date)
+    end_date = start_date + pd.Timedelta(days=int(num_days))
+
+
+    # Generate ticks at the start of each month
+    month_starts = pd.date_range(start=start_date, end=end_date, freq='MS')
+    xticks = (month_starts - start_date).days  # x values are in "days since start"
+
+    # Show label every n months AND always label the last tick
+    xlabels = []
+    for i, date in enumerate(month_starts):
+        if i % label_every_n_months == 0 or i == len(month_starts) - 1:
+            xlabels.append(date.strftime('%b \n %Y'))
+        else:
+            xlabels.append('')
+
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(
+        xlabels,
+        fontsize=8
+    )
+
+    #ax.set_xticklabels(xlabels) #, rotation=45
+    #ax.grid(True, which='both', axis='x', linestyle='--', alpha=0.5)
+
+
 class Point_Process_Model:
-    def __init__(self,model,data,A,T,spatial_cov=None,cov_names=None,
-                 cov_grid_size=None,standardize_cov=True,**priors):
+    def __init__(self,model,data,A,T,offset_seasonal=0,spatial_cov=None,cov_names=None,
+                 cov_grid_size=None,standardize_cov=True,**kwargs):
         """
         Spatiotemporal Point Process Model.
         The data is rescaled to fit in a 1x1 spatial grid and a lenght 50 time window. Posterior samples must be interpreted with this in mind.
@@ -80,7 +128,7 @@ class Point_Process_Model:
         T: float
             Maximum time in region of interest. Time is assumed to spart at 0.
         spatial_cov: str,pd.DataFrame,gpd.GeoDataFrame
-            Either file path (.csv or .shp), DataFrame, or GeoDataFrame containing spatial covariates. 
+            Either file path (.csv or .shp), DataFrame, or GeoDataFrame containing spatial covariates.
             Spatial covariates must cover all the points in data.
             If spatial_cov is a csv or pd.DataFrame, the first 2 columns must be 'X', 'Y' and cov_grid_size must be specified.
         cov_names: list
@@ -95,9 +143,10 @@ class Point_Process_Model:
         if type(data)==str:
             data = pd.read_csv(data)
         self.data = data
-        
+
         args={}
         args['T']=50
+        args['S']=24 #24
         # Spatial grid is 1x1
         args['t_min']=0
         args['x_min']=0
@@ -105,6 +154,8 @@ class Point_Process_Model:
         args['y_min']=0
         args['y_max']=1
         args['model']=model
+
+        args['offset_seasonal'] = offset_seasonal
 
         if type(A) is gpd.GeoDataFrame:
             A_ = np.stack((A.bounds.min(axis=0)[['minx','miny']],
@@ -115,13 +166,23 @@ class Point_Process_Model:
             args['A_area'] = 1
             A_ = A
         args['A_'] = A_
-        
-        #create computational grid
+
+        # create computational grids
+
+        # time grid
         n_t=50
         x_t = jnp.arange(0, args['T'], args['T']/n_t)
         args["n_t"]=n_t
         args["x_t"]=x_t
-        
+
+        # seasonal grid
+        n_s=24 #24
+        x_a = jnp.arange(0, args['S'], args['S']/n_s)
+        args["n_s"]=n_s
+        args["x_a"]=x_a
+        self.S = 365
+
+        # spatial grid
         n_xy = 25
         args["n_xy"]= n_xy
         cols = np.arange(0, 1, 1/n_xy)
@@ -132,7 +193,7 @@ class Point_Process_Model:
         comp_grid = gpd.GeoDataFrame({'geometry':polygons,'comp_grid_id':np.arange(n_xy**2)})
         comp_grid.geometry = comp_grid.geometry.scale(xfact=A_[0,1]-A_[0,0],yfact=A_[1,1]-A_[1,0],
                                                       origin=(0,0)).translate(A_[0,0],A_[1,0])
-        
+
         if type(A) is gpd.GeoDataFrame:
             # find grid cells overlapping with A
             comp_grid.crs = A.crs
@@ -141,32 +202,46 @@ class Point_Process_Model:
         else:
             self.A = comp_grid
             args['spatial_grid_cells'] = np.arange(25**2)
-        
+
         self.comp_grid = comp_grid
         self.T = T
-        
+
         args,points = self._scale_xyt(data,args,comp_grid)
         self.points = points
-        
+
+        window = args.get('window', None)
+        if window is not None:
+            spatial_window = self.args.get('spatial_window', None)
+            self.set_window(window, spatial_window)
+
         if args['model'] in ['lgcp','cox_hawkes']:
-            args["gp_kernel"]=exp_sq_kernel 
-            
+            args["gp_kernel"]=exp_sq_kernel
+
             # temporal VAE training arguments
             args["hidden_dim_temporal"]= 35
             args["z_dim_temporal"]= 11
+
+            # seasonal VAE training arguments
+            args["hidden_dim1_seasonal"]= 24 #75 #35
+            args["hidden_dim2_seasonal"]= 12 #50 #30
+            args["z_dim_seasonal"]= 8 #20 #50 #10 11
 
             # spatial VAE training arguments
             args["hidden_dim1_spatial"]= 75
             args["hidden_dim2_spatial"]= 50
             args["z_dim_spatial"]=20
-        
+
             decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/decoder_1d_T50_fixed_ls"))
             args["decoder_params_temporal"] = decoder_params
-            
+
+            # load decoder for seasonal
+            decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/decoder_1d_T24_circ_small_l8"))
+            args["decoder_params_seasonal"] = decoder_params
+
             #Load 2d spatial trained decoder
             decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/2d_decoder_15_5_large.pkl"))
             args["decoder_params_spatial"] = decoder_params
-        
+
         if spatial_cov is not None:
             #convert input into geopandas dataframe.
             if type(spatial_cov)==str:
@@ -178,33 +253,36 @@ class Point_Process_Model:
                 polygons = []
                 for i in spatial_cov.index:
                     polygons.append(Polygon([(spatial_cov.loc[i,'X']-cov_grid_size[0]/2,
-                                              spatial_cov.loc[i,'Y']-cov_grid_size[1]/2), 
+                                              spatial_cov.loc[i,'Y']-cov_grid_size[1]/2),
                                              (spatial_cov.loc[i,'X']+cov_grid_size[0]/2,
-                                              spatial_cov.loc[i,'Y']-cov_grid_size[1]/2), 
+                                              spatial_cov.loc[i,'Y']-cov_grid_size[1]/2),
                                              (spatial_cov.loc[i,'X']+cov_grid_size[0]/2,
-                                              spatial_cov.loc[i,'Y']+cov_grid_size[1]/2), 
+                                              spatial_cov.loc[i,'Y']+cov_grid_size[1]/2),
                                              (spatial_cov.loc[i,'X']-cov_grid_size[0]/2,
                                               spatial_cov.loc[i,'Y']+cov_grid_size[1]/2)]))
                 spatial_cov = gpd.GeoDataFrame(data=spatial_cov,geometry=polygons)
                 spatial_cov.crs = self.A.crs
+
             spatial_cov['cov_ind'] = np.arange(len(spatial_cov))
             #find covariate cell index for each point
             self.points.crs = spatial_cov.crs
             args['cov_ind'] = self.points.sjoin(spatial_cov).sort_values(by='point_id')['cov_ind'].values
             if len(args['cov_ind']) != len(self.points):
                 raise Exception("Spatial covariates are not defined for all data points!")
-            
+
             args['num_cov'] = len(cov_names)
             self.cov_names = cov_names
             self.spatial_cov = spatial_cov
-            
+
             X_s = spatial_cov[self.cov_names].values
+            if X_s.ndim == 1:
+                X_s = X_s[:, None]
             # standardize covariates
             if standardize_cov:
                 args['spatial_cov'] = (X_s-X_s.mean(axis=0))/(X_s.var(axis=0)**0.5)
             else:
                 args['spatial_cov'] = X_s
-            
+
             #Create Computational Grid GeoDataFrame
             if args['model'] in ['lgcp','cox_hawkes']:
                 self.comp_grid.crs = spatial_cov.crs
@@ -223,17 +301,17 @@ class Point_Process_Model:
         if 'num_cov' in args:
             default_priors["w"] = dist.Normal(jnp.zeros(args['num_cov']),jnp.ones(args["num_cov"]))
         args['sp_var_mu'] = 2.0
-        for par, prior in priors.items():
+        for par, prior in kwargs.items():
             if isinstance(prior,dist.Distribution):
                 default_priors[par] = prior
             else:
                 raise Exception(f"Unknown argument {par}. Prior distributions must be instances of numpyro Distribution.")
         args['priors'] = default_priors
         self.args = args
-    
+
     def __str__(self):
         return "Point Process Model"
-    
+
     def load_rslts(self,file_name):
         """
         Load previously computed results
@@ -266,8 +344,8 @@ class Point_Process_Model:
         output['samples'] = self.samples
         with open(file_name, 'wb') as f:
             output = pickle.dump(output,f)
-        
-    
+
+
     def run_svi(self,num_steps,lr,num_samples=1000,resume=False,plot_loss=True,**kwargs):
         """
         Perform Stochastic Variational Inference on the model.
@@ -282,7 +360,7 @@ class Point_Process_Model:
         num_steps: int, default=10000
             Number of interations for SVI to run.
         plot_loss: bool
-            
+
         auto_guide: numpyro AutoGuide, default=AutoMultivariateNormal
             See numpyro AutoGuides for details.
         init_strategy: function, default=init_to_median
@@ -310,12 +388,12 @@ class Point_Process_Model:
         plt.ylabel("Loss")
         plt.show()
 
-    
+
     def run_mcmc(self,batch_size=1,num_warmup=500,num_samples=1000,
                  num_chains=1,thinning=1):
         """
         Run MCMC posterior sampling on model.
-        
+
         Parameters
         ----------
         batch_size: int
@@ -332,17 +410,21 @@ class Point_Process_Model:
         self.args["thinning"] = thinning
         rng_key, rng_key_predict = random.split(random.PRNGKey(10))
         rng_key, rng_key_post, rng_key_pred = random.split(rng_key, 3)
-        
+
         self.mcmc = run_mcmc(rng_key_post, self.model, self.args)
         self.samples=self.mcmc.get_samples()
-        
+
 
     def _scale_xyt(self,data,args,comp_grid):
         #scale temporal events
-        t_events_total=data['T'].values/self.T*50
+        t_events_total=data['T'].values/self.T*args["n_t"]
         args["t_events"]=t_events_total
         args['indices_t']=np.searchsorted(args['x_t'], t_events_total, side='right')-1
-        
+
+        a_events_total=data['A'].values/self.S*args["n_s"]
+        args["a_events"]=a_events_total
+        args['indices_a']=np.searchsorted(args['x_a'], a_events_total, side='right')-1
+
         #scale spatial events
         x_range = args['A_'][0]
         x_events_total=(data['X']-x_range[0]).to_numpy()
@@ -350,46 +432,48 @@ class Point_Process_Model:
         y_range = args['A_'][1]
         y_events_total=(data['Y']-y_range[0]).to_numpy()
         y_events_total/=(y_range[1]-y_range[0])
-        
+
         xy_events_total=np.array((x_events_total,y_events_total)).transpose()
 
         geometry = gpd.points_from_xy(data.X, data.Y,crs=comp_grid.crs)
         points = gpd.GeoDataFrame(data=data,geometry=geometry)
         points['point_id'] = np.arange(len(data))
-        
+
         #find grid cells where points are located
         args['indices_xy'] = points.sjoin(comp_grid).sort_values(by='point_id')['comp_grid_id'].values
-        
+
         if len(args['indices_xy']) != len(points):
             raise Exception("Computational grid does not encompass all data points!")
-            
+
         args["xy_events"]=xy_events_total.transpose()
         return args,points
 
-    def log_expected_likelihood(self,data):
-        """
-        Computes the log expected likelihood for test data.
-        $$E_{\theta|X}[\ell] = log(\frac{1}{S}\sum_{s=1}{S}{p(X|\theta^s)})$$
-        Parameters
-        ----------
-        data: pd.DataFrame or str
-            test events in the same format as original event dataset.
-        """
-        #Based on https://programtalk.com/vs4/python/pyro-ppl/numpyro/examples/baseball.py/
-        if type(data)==str:
+    def log_expected_likelihood(self, data):
+        if type(data) == str:
             data = pd.read_csv(data)
-        test_args,points = self._scale_xyt(data,self.args.copy(),self.comp_grid)
+        if 'day' in data.columns:
+            data = data.drop(columns=['day'])
+        for col in ['X', 'Y', 'T']:
+            if not np.issubdtype(data[col].dtype, np.number):
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+        data = data.dropna(subset=['X', 'Y', 'T'])
+        if len(data) == 0:
+            raise ValueError("No valid data points after cleaning")
+
+        # Only pass the minimal required arguments for likelihood
+        test_args, points = self._scale_xyt(data, self.args.copy(), self.comp_grid)
         if 'cov_ind' in self.args:
             test_args['cov_ind'] = points.sjoin(self.spatial_cov).sort_values(by='point_id')['cov_ind'].values
 
+        # Remove training-specific keys if present
+        for k in ['batch_size', 'num_samples', 'num_warmup', 'num_chains', 'thinning']:
+            test_args.pop(k, None)
+
+        print("Final test_args keys:", list(test_args.keys()))
         post_loglik = log_likelihood(self.model, self.samples, test_args)["t_events"]
-        
-        # computes expected log likelihood over the posterior
-        exp_log_density = logsumexp(post_loglik, axis=0) - jnp.log(
-            jnp.shape(post_loglik)[0]
-        )
+        exp_log_density = logsumexp(post_loglik, axis=0) - jnp.log(jnp.shape(post_loglik)[0])
         return exp_log_density.sum().item()
-    
+
     def expected_AIC(self):
         r"""
         Calculate the expected AIC over the posterior distribution.
@@ -399,7 +483,7 @@ class Point_Process_Model:
         k = sum(self.get_params().values())
         return -2*self.samples['loglik'].mean().item() + 2*k
 
-    
+
     def cov_weight_post_summary(self,trace=False):
         """
         Plot and summarize posteriors of weights and bias.
@@ -414,47 +498,162 @@ class Point_Process_Model:
             raise Exception("MCMC posterior sampling has not been performed yet.")
         if 'spatial_cov' not in self.args:
             raise Exception("Spatial covariates were not included in the model.")
-        
-        n = self.samples['w'].shape[1]+1
-        
-        if trace:
-            r = ceil(n**0.75)
-            c = ceil(n/r)
-        else:
-            c = ceil(n**0.5)
-            r = ceil(n/c)
-        fig, ax = plt.subplots(r,c,figsize=(10,10), sharex=False)
+
+        n = self.samples['w'].shape[1] + 1  # number of covariates + intercept
+        c = 2                       # always 2 columns
+        r = math.ceil(n / c)        # as many rows as needed
+        fig, ax = plt.subplots(r, c, figsize=(12, 3 * r), sharex=False)
         fig.suptitle('Covariate Weights', fontsize=16)
-        for i in range(n-1):
+        w_samples = self.samples['w']
+        if w_samples.ndim == 1:
+            w_samples = w_samples[:, None]
+
+        # Flatten ax for easy indexing
+        ax = ax.flatten()
+
+        for i in range(w_samples.shape[1]):
             if trace:
-                ax[i//c,i%c].plot(self.samples['w'].T[i])
-                ax[i//c,i%c].set_ylabel(self.cov_names[i])
+                ax[i].plot(w_samples[:, i])
+                ax[i].set_ylabel(self.cov_names[i])
             else:
-                ax[i//c,i%c].hist(self.samples['w'].T[i])
-                ax[i//c,i%c].set_xlabel(self.cov_names[i])
+                ax[i].hist(w_samples[:, i])
+                ax[i].set_xlabel(self.cov_names[i])
+        # Plot the intercept
         if trace:
-            ax[(n-1)//c,(n-1)%c].plot(self.samples['a_0'])
-            ax[(n-1)//c,(n-1)%c].set_ylabel("$a_0$")
+            ax[w_samples.shape[1]].plot(self.samples['a_0'])
+            ax[w_samples.shape[1]].set_ylabel("$a_0$")
         else:
-            ax[(n-1)//c,(n-1)%c].hist(self.samples['a_0'])
-            ax[(n-1)//c,(n-1)%c].set_xlabel("$a_0$")
-        #clear unused parts of the grid
-        for i in range(n,r*c):
-            ax[i//c, i%c].axis('off')
-        
-        w_samps = np.concatenate((self.samples['w'],self.samples['a_0'].reshape(-1,1)),axis=1)
+            ax[w_samples.shape[1]].hist(self.samples['a_0'])
+            ax[w_samples.shape[1]].set_xlabel("$a_0$")
+        # Hide unused axes
+        for j in range(n, len(ax)):
+            ax[j].axis('off')
+   
+
+        w_samps = np.concatenate((w_samples,self.samples['a_0'].reshape(-1,1)),axis=1)
         mean = w_samps.mean(axis=0)
         std = w_samps.var(axis=0)**0.5
         p = (w_samps>0).mean(axis=0)
         quantiles = np.quantile(w_samps,[0.025,0.975],axis=0)
         w_summary = pd.DataFrame({'Post Mean':mean,'Post Std':std,'P(w>0)':p,
                       '[0.025':quantiles[0],'0.975]':quantiles[1]},index=self.cov_names+['a_0'])
+
+        ##### Plot mean and 90% CI of weights #####
+        # fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+        # x = range(len(w_summary))
+
+        # # Extract values
+        # means = w_summary['Post Mean']
+        # lower = w_summary['[0.025']
+        # upper = w_summary['0.975]']
+        # errors = [means - lower, upper - means]
+
+        # ax.errorbar(
+        #     x,
+        #     means,
+        #     yerr=errors,
+        #     fmt='o',
+        #     capsize=3,
+        #     color='#990000',
+        #     ecolor='#011F5B',
+        #     label='90% CI'
+        # )
+
+        # # Horizontal zero line
+        # ax.axhline(0, color='black', linestyle='--', linewidth=1)
+
+        # # Labeling
+        # ax.set_xticks(x)
+
+        # wrapped_labels = [label.replace('_', '_\n') for label in w_summary.index]
+        # ax.set_xticklabels(wrapped_labels)
+
+        # ax.set_xlabel('Covariate')
+        # ax.set_ylabel('Weight Value')
+        # ax.yaxis.grid(True, color='lightgray', linestyle='--', linewidth=0.7, alpha=0.7)
+
+        # ax.legend()
+        # plt.tight_layout()
+        # plt.show()
+
+        ##### Plot mean and 90% CI of weights #####
+        fig, ax = plt.subplots(1, 1, figsize=(16, 5))
+        x = range(len(w_summary))
+
+        # Extract values
+        means = w_summary['Post Mean']
+        lower = w_summary['[0.025']
+        upper = w_summary['0.975]']
+        errors = [means - lower, upper - means]
+
+        ax.errorbar(
+            x,
+            means,
+            yerr=errors,
+            fmt='o',
+            capsize=3,
+            color='#990000',
+            ecolor='#011F5B',
+            label='90% CI'
+        )
+
+        # Horizontal zero line
+        ax.axhline(0, color='black', linestyle='--', linewidth=1)
+
+        # --- NEW: vertical separators (dashed blue) ---
+        # Pairs to separate (left, right)
+        pairs = [
+            ('edu_hd_avg', 'ndvi_mean_4yr'),  # 'edu_hd_avg' handled below (typo -> 'edu_hs_avg')
+            ('ndvi_mean_4yr', 'RLD'),
+            ('GW', 'vac_area'),
+            ('landcare_area', 'alloc_avg_d_cnt'),
+            ('unique_device_ratio_aw', 'reporting_rate'),
+            ('reporting_rate','betweenness_avg_w')
+        ]
+
+        # Map names to indices in your plotted order
+        name_to_idx = {name: i for i, name in enumerate(w_summary.index)}
+
+        # Normalize the possible typo
+        def _fix(name):
+            return 'edu_hs_avg' if name == 'edu_hd_avg' else name
+
+        # Compute x-positions (midpoints) and draw lines
+        for a, b in pairs:
+            a, b = _fix(a), _fix(b)
+            if a in name_to_idx and b in name_to_idx:
+                mid = 0.5 * (name_to_idx[a] + name_to_idx[b])
+                ax.axvline(mid, color='blue', linestyle='--', linewidth=1, alpha=0.8, zorder=0)
+            else:
+                # If a name isn't present, skip silently; optionally print/log a warning
+                pass
+
+        # Labeling
+        ax.set_xticks(list(x))
+        wrapped_labels = [label.replace('_', '_\n') for label in w_summary.index]
+        ax.set_xticklabels(wrapped_labels,fontsize = 7)
+
+        ax.set_xlabel('Covariate')
+        ax.set_ylabel('Weight Value')
+        ax.yaxis.grid(True, color='lightgray', linestyle='--', linewidth=0.7, alpha=0.7)
+
+        # Make sure end separators (if any) are visible
+        ax.set_xlim(-0.5, len(w_summary) - 0.5)
+
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+
         return w_summary
-    
-    def plot_temporal(self,rescale=True):
+
+
+       
+
+    def plot_temporal(self, rescale=True, start_date=None):
         """
         Plot mean posterior temporal gaussian process.
-        
+
         Parameters
         ----------
         rescale: bool
@@ -464,29 +663,453 @@ class Point_Process_Model:
             raise Exception("MCMC posterior sampling has not been performed yet.")
         if self.args['model'] not in ['cox_hawkes','lgcp']:
             raise Exception("Nothing to plot: temporal background in constant.")
-        
+
         b_scale = 1.
         if rescale:
             b_scale = 50/self.T
-        x_t = jnp.arange(0, self.args['T'], self.args['T']/self.args["n_t"])/b_scale
+        # x_t = jnp.arange(0, self.args['T'], self.args['T']/self.args["n_t"])/b_scale
+        x_t = jnp.linspace(0, self.args["T"], self.args["n_t"] + 1)[:-1] / b_scale
         f_t_post=self.samples["f_t"]
         f_t_hpdi = hpdi(self.samples["f_t"])
         f_t_post_mean=jnp.mean(f_t_post, axis=0)
-        
-        fig,ax=plt.subplots(1,1,figsize=(8,5))
+
+        fig,ax=plt.subplots(1,1,figsize=(15,5)) #(8,5)
+
+
+        # Plot the temporal intensity
         event_time_height = np.ones(len(self.args['t_events']))*f_t_hpdi.min()
-        ax.plot(self.args['t_events']/b_scale, event_time_height,'+',color="red", 
+        ax.plot(self.args['t_events']/b_scale, event_time_height,'+',color="red",
                 alpha=.15, label="observed times")
         ax.set_ylabel('$f_t$')
         ax.set_xlabel('t')
+
+        ## adjust grid
+        ax.grid(True, which='both', axis='both', linestyle=':', linewidth=0.6, alpha=0.3)
+
         ax.plot(x_t, f_t_post_mean, label="mean estimated $f_t$")
         ax.fill_between(x_t, f_t_hpdi[0], f_t_hpdi[1], alpha=0.4, color="palegoldenrod", label="90%CI rate")
+
+        # Set labels
+        ax.set_ylabel('$f_t$')
+        if start_date is not None:
+            ax.set_xlabel("Date")
+            total_days = x_t.max()
+            #add_month_grid_and_labels(ax, start_date, total_days)
+            add_month_grid_and_labels(ax, start_date, total_days, label_every_n_months=3)
+            ##########################################################
+        else:
+            ax.set_xlabel('t')
+            ax.grid(True, which='both', axis='x', linestyle='--', alpha=0.5)
+
+        # ax.set_xmargin(0)          # same idea as margins(x=0), but explicit for x
+        ax.set_xlim(float(x_t.min()), float(x_t.max()))
+
         ax.legend()
+        plt.tight_layout()
+
+    #------------------------------------------------ 
+    def plot_temporal_components(
+    self,
+    rescale=True,
+    start_date=None,
+    show_gp=True,
+    show_hist=False,
+    ax=None
+    ):
+        """
+        Plot temporal components:
+        - GP mean + CI (left y-axis)
+        - Optional event-time histogram (right y-axis)
+
+        You can draw GP only, histogram only, or both stacked together.
+
+        Parameters
+        ----------
+        rescale : bool
+            Scale posteriors to original dimensions of the data.
+        start_date : datetime/date/str or None
+            If provided, x-axis will be labeled as dates.
+        show_gp : bool
+            Whether to draw GP mean and CI.
+        show_hist : bool
+            Whether to draw event-time histogram.
+        """
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+        if self.args['model'] not in ['cox_hawkes', 'lgcp']:
+            raise Exception("Nothing to plot: temporal background is constant.")
+
+        if not show_gp and not show_hist:
+            raise ValueError("At least one of show_gp or show_hist must be True.")
+
+        b_scale = 1.
+        if rescale:
+            b_scale = 50 / self.T
+
+        x_t = jnp.linspace(
+            0, self.args["T"], self.args["n_t"] + 1
+        )[:-1] / b_scale
+
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(15, 5))
+        ax2 = None
+
+        # =========================
+        # GP posterior (left axis)
+        # =========================
+        if show_gp:
+            f_t_post = self.samples["f_t"]
+            f_t_hpdi = hpdi(f_t_post)
+            f_t_post_mean = jnp.mean(f_t_post, axis=0)
+
+            event_time_height = np.ones(len(self.args['t_events'])) * f_t_hpdi.min()
+            ax.plot(
+                self.args['t_events'] / b_scale,
+                event_time_height,
+                '+',
+                color="red",
+                alpha=.15,
+                label="observed times"
+            )
+
+            ax.plot(x_t, f_t_post_mean, label="mean estimated $f_t$")
+            ax.fill_between(
+                x_t,
+                f_t_hpdi[0],
+                f_t_hpdi[1],
+                alpha=0.4,
+                color="palegoldenrod",
+                label="90%CI rate"
+            )
+
+            ax.set_ylabel('$f_t$')
+            ax.grid(True, which='both', axis='both',
+                    linestyle=':', linewidth=0.6, alpha=0.3)
+
+        # =========================
+        # Histogram (right axis)
+        # =========================
+        if show_hist:
+            ax2 = ax.twinx()
+
+            t_events = np.asarray(self.args["t_events"]) / b_scale
+            bins = np.linspace(
+                float(x_t.min()),
+                float(x_t.max()),
+                int(self.args["n_t"]) + 1
+            )
+
+            ax2.hist(
+                t_events,
+                bins=bins,
+                alpha=0.25,
+                edgecolor="none",
+                label="event frequency"
+            )
+
+            ax2.set_ylabel("Frequency")
+            ax2.grid(False)
+
+        # =========================
+        # X-axis formatting
+        # =========================
+        if start_date is not None:
+            ax.set_xlabel("Date")
+            total_days = x_t.max()
+            add_month_grid_and_labels(
+                ax, start_date, total_days, label_every_n_months=3
+            )
+        else:
+            ax.set_xlabel('t')
+
+        ax.set_xlim(float(x_t.min()), float(x_t.max()))
+        if ax2 is not None:
+            ax2.set_xlim(float(x_t.min()), float(x_t.max()))
+
+        # =========================
+        # Legend handling
+        # =========================
+        handles, labels = ax.get_legend_handles_labels()
+        if ax2 is not None:
+            h2, l2 = ax2.get_legend_handles_labels()
+            handles += h2
+            labels += l2
+
+        if handles:
+            ax.legend(handles, labels, loc="best")
+
+        plt.tight_layout()
+#------------------------------------------------    
         
-    def plot_spatial(self,include_cov=False,**kwargs):
+
+    def plot_seasonal(self,rescale=True,ref_year=2021):
+        """
+        Plot mean posterior seasonal gaussian process.
+
+        Parameters
+        ----------
+        rescale: bool
+            Scale posteriors to original dimensions of the data.
+        """
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+        if self.args['model'] not in ['cox_hawkes','lgcp']:
+            raise Exception("Nothing to plot: seasonal background in constant.")
+
+        offset = self.args['offset_seasonal']
+
+        # Create month start positions (in days since Jan 1)
+        month_days = np.cumsum([0] + [calendar.monthrange(ref_year, m)[1] for m in range(1, 12)])
+        month_names = list(calendar.month_abbr)[1:]  # ['January', ..., 'December']
+
+        # Apply offset and wrap around using modulo
+        month_days_offset = (month_days + offset) % self.S
+
+        # Sort for plotting (modulo wrap-around may disorder them)
+        sorted_idx = np.argsort(month_days_offset)
+        xticks = month_days_offset[sorted_idx]
+        xlabels = [month_names[i] for i in sorted_idx]
+
+        b_scale = 1.
+        if rescale:
+            b_scale = self.args["n_s"]/self.S
+        x_a = jnp.arange(0, self.args["S"], self.args["S"]/self.args["n_s"]) / b_scale
+        f_a_post=self.samples["f_a"]
+        f_a_hpdi = hpdi(self.samples["f_a"])
+        f_a_post_mean=jnp.mean(f_a_post, axis=0)
+
+        fig,ax=plt.subplots(1,1,figsize=(9,5))
+        event_time_height = np.ones(len(self.args['a_events']))*f_a_hpdi.min()
+        ax.plot(self.args['a_events']/b_scale, event_time_height,'+',color="red",
+                alpha=.15, label="observed times")
+        ax.set_ylabel('$f_a$')
+        ax.set_xlabel('Date')
+        ax.set_xticks(xticks)
+        #ax.set_xticklabels(xlabels, rotation=45)
+        ax.set_xticklabels(
+        xlabels,
+        fontsize=8
+        )
+        #ax.grid(True, which='both', axis='both', linestyle='--', alpha=0.5)
+        ax.grid(True, which='both', axis='both', linestyle=':', linewidth=0.6, alpha=0.3)
+
+        ax.plot(x_a, f_a_post_mean, label="mean estimated $f_a$")
+        ax.fill_between(x_a, f_a_hpdi[0], f_a_hpdi[1], alpha=0.4, color="palegoldenrod", label="90%CI rate")
+        ax.legend(loc='upper right')
+
+#------------------------------------------------    
+    def plot_seasonal_components(
+        self,
+        rescale=True,
+        ref_year=2021,
+        show_gp=True,
+        show_hist=False,
+        ax=None
+    ):
+        """
+        Plot seasonal components:
+        - GP mean + CI (left y-axis)
+        - Optional event-time histogram (right y-axis)
+
+        You can draw GP only, histogram only, or both stacked together.
+
+        Parameters
+        ----------
+        rescale : bool
+            Scale posteriors to original dimensions of the data.
+        ref_year : int
+            Reference year for month calculations.
+        show_gp : bool
+            Whether to draw GP mean and CI.
+        show_hist : bool
+            Whether to draw event-time histogram.
+        ax : matplotlib.axes.Axes, optional
+            Axes to plot on. If None, creates a new figure.
+        """
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+        if self.args['model'] not in ['cox_hawkes','lgcp']:
+            raise Exception("Nothing to plot: seasonal background is constant.")
+
+        if not show_gp and not show_hist:
+            raise ValueError("At least one of show_gp or show_hist must be True.")
+
+        offset = self.args['offset_seasonal']
+
+        # Create month start positions (in days since Jan 1)
+        month_days = np.cumsum([0] + [calendar.monthrange(ref_year, m)[1] for m in range(1, 12)])
+        month_names = list(calendar.month_abbr)[1:]  # ['Jan', ..., 'Dec']
+
+        # Apply offset and wrap around using modulo
+        month_days_offset = (month_days + offset) % self.S
+
+        # Sort for plotting (modulo wrap-around may disorder them)
+        sorted_idx = np.argsort(month_days_offset)
+        xticks = month_days_offset[sorted_idx]
+        xlabels = [month_names[i] for i in sorted_idx]
+
+        b_scale = 1.
+        if rescale:
+            b_scale = self.args["n_s"]/self.S
+        x_a = jnp.arange(0, self.args["S"], self.args["S"]/self.args["n_s"]) / b_scale
+        f_a_post = self.samples["f_a"]
+        f_a_hpdi = hpdi(self.samples["f_a"])
+        f_a_post_mean = jnp.mean(f_a_post, axis=0)
+
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(9, 5))
+        ax2 = None
+
+        # =========================
+        # GP posterior (left axis)
+        # =========================
+        if show_gp:
+            event_time_height = np.ones(len(self.args['a_events'])) * f_a_hpdi.min()
+            ax.plot(
+                self.args['a_events']/b_scale,
+                event_time_height,
+                '+',
+                color="red",
+                alpha=.15,
+                label="observed times"
+            )
+
+            ax.plot(x_a, f_a_post_mean, label="mean estimated $f_a$")
+            ax.fill_between(
+                x_a,
+                f_a_hpdi[0],
+                f_a_hpdi[1],
+                alpha=0.4,
+                color="palegoldenrod",
+                label="90%CI rate"
+            )
+
+            ax.set_ylabel('$f_a$')
+            ax.grid(True, which='both', axis='both',
+                    linestyle=':', linewidth=0.6, alpha=0.3)
+
+        # =========================
+        # Histogram (right axis)
+        # =========================
+        if show_hist:
+            ax2 = ax.twinx()
+
+            a_events = np.asarray(self.args["a_events"]) / b_scale
+            bins = np.linspace(
+                float(x_a.min()),
+                float(x_a.max()),
+                int(self.args["n_s"]) + 1
+            )
+
+            ax2.hist(
+                a_events,
+                bins=bins,
+                alpha=0.25,
+                edgecolor="none",
+                color="#E87A90",
+                label="event frequency"
+            )
+
+            ax2.set_ylabel("Frequency")
+            ax2.grid(False)
+
+        # =========================
+        # X-axis formatting
+        # =========================
+        ax.set_xlabel('Date')
+        ax.set_xticks(xticks)
+        ax.set_xticklabels(xlabels, fontsize=8)
+
+        # Remove gaps on left and right edges
+        ax.set_xlim(float(x_a.min()), float(x_a.max()))
+        if ax2 is not None:
+            ax2.set_xlim(float(x_a.min()), float(x_a.max()))
+
+        # =========================
+        # Legend handling
+        # =========================
+        handles, labels = ax.get_legend_handles_labels()
+        if ax2 is not None:
+            h2, l2 = ax2.get_legend_handles_labels()
+            handles += h2
+            labels += l2
+
+        if handles:
+            ax.legend(handles, labels, loc="best")
+
+        plt.tight_layout()
+#------------------------------------------------    
+    def plot_temp_date(self, start_date, rescale=True):
+        """
+        Plot mean posterior temporal gaussian process with dates on x-axis.
+
+        Parameters
+        ----------
+        start_date: str
+            The starting date in 'YYYY-MM-DD' format. This should match the start date
+            of your original dataset.
+        rescale: bool
+            Scale posteriors to original dimensions of the data.
+        """
+        if start_date == '2023-01-01':
+            warnings.warn("Using default start date. Please specify the correct start date for your dataset.")
+
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+        if self.args['model'] not in ['cox_hawkes','lgcp']:
+            raise Exception("Nothing to plot: temporal background in constant.")
+
+        # Convert start_date to datetime
+        start_date = pd.to_datetime(start_date)
+
+        # Time scaling
+        b_scale = 1.
+        if rescale:
+            b_scale = 50/self.T
+
+        # Create time grid and convert to dates
+        x_t = jnp.arange(0, self.args['T'], self.args['T']/self.args["n_t"])/b_scale
+        dates_t = [start_date + pd.Timedelta(days=float(t)) for t in x_t]
+
+        # Get posterior samples and calculate statistics
+        f_t_post = self.samples["f_t"]
+        f_t_hpdi = hpdi(self.samples["f_t"])
+        f_t_post_mean = jnp.mean(f_t_post, axis=0)
+
+        # Convert event times to dates
+        event_dates = [start_date + pd.Timedelta(days=float(t)) for t in self.args['t_events']/b_scale]
+
+        # Create plot
+        fig, ax = plt.subplots(1,1,figsize=(8,5))
+
+        # Plot event times
+        event_time_height = np.ones(len(event_dates))*f_t_hpdi.min()
+        ax.plot(event_dates, event_time_height, '+', color="red",
+                alpha=.15, label="observed times")
+
+        # Plot posterior mean and confidence interval
+        ax.plot(dates_t, f_t_post_mean, label="mean estimated $f_t$")
+        ax.fill_between(dates_t, f_t_hpdi[0], f_t_hpdi[1], alpha=0.4,
+                        color="palegoldenrod", label="90%CI rate")
+
+        # Format x-axis
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.xticks(rotation=45)
+
+        # Add labels and legend
+        ax.set_ylabel('$f_t$')
+        ax.set_xlabel('Date')
+        ax.legend()
+
+        # Adjust layout to prevent label cutoff
+        #plt.tight_layout()
+
+        #return fig
+
+    def plot_spatial(self,include_cov=False, **kwargs):
         """
         Plot mean posterior spatial intensity (ignoring self-excitation) with/without covariates
-        
+
         Parameters
         ----------
         include_cov: bool
@@ -503,19 +1126,21 @@ class Point_Process_Model:
 
         if 'alpha' not in kwargs:
             kwargs['alpha'] = .1
-        
+
         if self.args['model'] in ['cox_hawkes','lgcp'] and include_cov:
             self._plot_cov_comp_grid(**kwargs)
+            #self._plot_cov_comp_grid(ax_list=ax_list, **kwargs)
         elif include_cov:
             self._plot_cov(**kwargs)
         else:
             self._plot_grid(**kwargs)
+            #self._plot_grid(ax_list=ax_list, **kwargs)
 
     def _plot_grid(self,**kwargs):
         """
         Plot spatial for computational grid only
         """
-        
+
         f_xy_post = self.samples["f_xy"]
         f_xy_post_mean=jnp.mean(f_xy_post, axis=0)
         self.comp_grid['post_mean'] = f_xy_post_mean
@@ -529,14 +1154,15 @@ class Point_Process_Model:
         self.points.plot(ax=ax[1],color='red',marker='x',**kwargs)
         ax[1].set_title('Mean Posterior $f_s$ With Events')
         return fig
-    
+
     def _plot_cov_comp_grid(self,**kwargs):
         """
         Plot spatial for computational grid and spatial covariates.
         """
-        post_samples = (self.samples['b_0'][:,self.args['int_df']['cov_ind'].values] + 
+        post_samples = (self.samples['b_0'][:,self.args['int_df']['cov_ind'].values] +
                         self.samples["f_xy"][:,self.args['int_df']['comp_grid_id'].values])
         self.args['int_df']['post_mean'] = post_samples.mean(axis=0)
+
         fig, ax = plt.subplots(1,3, figsize=(10, 5),gridspec_kw={'width_ratios': [10,10,1]})
         self.args['int_df'].plot(column='post_mean',ax=ax[0])
         ax[0].set_title('Mean Posterior $f_s + X(s)w$')
@@ -545,7 +1171,7 @@ class Point_Process_Model:
         self.args['int_df'].plot(column='post_mean',ax=ax[1],legend=True,cax=cbar_ax)
         self.points.plot(ax=ax[1],color='red',marker='x',**kwargs)
         ax[1].set_title('Mean Posterior $f_s + X(s)w$ With Events')
-        
+
     def _plot_cov(self,**kwargs):
         """
         Plot spatial for covariates only.
@@ -560,56 +1186,248 @@ class Point_Process_Model:
         ax[1].set_title('Mean Posterior $X(s)w$ With Events')
         self.points.plot(ax=ax[1],color='red',marker='x',**kwargs)
         ax[1].set_title('Mean Posterior $f_s + X(s)w$ With Events')
-    
+
     def _sim_spatial(self, geo_df):
         lam = geo_df['area']*np.exp(geo_df['log_intensity'])
         num_samp = np.random.poisson(lam)
         mask_zero = num_samp!=0
         samples = geo_df[mask_zero].sample_points(size=num_samp[mask_zero])
         return samples.explode(index_parts=False)
-    
-    def _sim_cox(self,parameters):
+
+#    def _sim_cox(self,parameters):
+#        if 'spatial_cov' in self.args:
+#            geo_df = self.args['int_df']
+#            geo_df['spatial_log_intensity'] = (parameters['b_0'][geo_df['cov_ind'].values] +
+#                                   parameters['f_xy'][geo_df['comp_grid_id'].values])
+#        else:
+#            geo_df = self.comp_grid
+#            geo_df['spatial_log_intensity'] = parameters["f_xy"]
+#            geo_df = geo_df.sjoin(self.A,how='inner')
+#            geo_df['area'] = 1/self.args['n_xy']**2
+#        f_t = parameters['f_t']
+#        f_a = parameters['f_a']
+#        a_0 = parameters['a_0']
+#        t_lat = np.arange(0,self.args['T'],self.args['T']/self.args['n_t'])
+#        sp_samp = list()
+#        t_samp = list()
+#        # duration of each bin in days
+#        dt = self.T / self.args['T']
+#        for i in range(self.args['T']):
+#            t_i = i * dt
+#            t_in_year = (t_i + self.args['offset_seasonal']) % self.S
+#            a_i = int((t_in_year / self.S) * self.args['n_s'])
+#            geo_df['log_intensity'] = geo_df['spatial_log_intensity'] + a_0 + f_t[i] + f_a[a_i]
+#            sp_samp.append(self._sim_spatial(geo_df))
+#            t_samp.append(np.random.uniform(size=len(sp_samp[-1]))+t_lat[i])
+#        sp = np.hstack([(p.x,p.y) for p in sp_samp])
+#        bg = np.append(sp.T,np.hstack(t_samp).reshape(-1,1),1)
+#        return bg
+
+    def _sim_cox(self, parameters):
+        # Spatial log intensity setup
         if 'spatial_cov' in self.args:
             geo_df = self.args['int_df']
-            geo_df['spatial_log_intensity'] = (parameters['b_0'][geo_df['cov_ind'].values] + 
-                                   parameters['f_xy'][geo_df['comp_grid_id'].values])
+            geo_df['spatial_log_intensity'] = (
+                parameters['b_0'][geo_df['cov_ind'].values] +
+                parameters['f_xy'][geo_df['comp_grid_id'].values]
+            )
         else:
             geo_df = self.comp_grid
             geo_df['spatial_log_intensity'] = parameters["f_xy"]
-            geo_df = geo_df.sjoin(self.A,how='inner')
-            geo_df['area'] = 1/self.args['n_xy']**2
-        f_t = parameters['f_t']
-        a_0 = parameters['a_0']
-        t_lat = np.arange(0,self.args['T'],self.args['T']/self.args['n_t'])
+            geo_df = geo_df.sjoin(self.A, how='inner')
+            geo_df['area'] = 1 / self.args['n_xy']**2
+
+        # Parameter unpacking
+        f_t = parameters['f_t']  # Long-term temporal trend
+        f_a = parameters['f_a']  # Seasonal trend
+        a_0 = parameters['a_0']  # Global intercept
+
+        # Time setup
+        total_time = self.T         # Total time duration (e.g. in days)
+        n_t = self.args['T']        # Number of long-term bins
+        S = self.S                  # Length of seasonal period (e.g. 365 for 1 year)
+        n_s = self.args['n_s']      # Number of seasonal bins per year
+
+        # Finer seasonal binning: number of years × seasonal bins per year
+        n_years = int(total_time / S)
+        n_seasonal_bins = n_years * n_s
+        dt = S / n_s                # Duration of each seasonal bin
+        t_lat = np.arange(0, total_time, dt)
+
         sp_samp = list()
         t_samp = list()
-        for i in range(self.args['T']):
-            geo_df['log_intensity'] = geo_df['spatial_log_intensity']+a_0+f_t[i]
+
+        for i in range(n_seasonal_bins):
+            t_i = i * dt
+            # Seasonal bin index within a year
+            a_i = i % n_s
+            # Corresponding coarse long-term bin index
+            lt_i = int((t_i / total_time) * n_t)
+
+            # Add offset for seasonal effect
+            t_in_year = (t_i + self.args['offset_seasonal']) % S
+            a_i = int((t_in_year / S) * n_s)
+
+            # Total log intensity
+            geo_df['log_intensity'] = (
+                geo_df['spatial_log_intensity'] +
+                a_0 +
+                f_t[lt_i] +
+                f_a[a_i]
+            )
+
+            # Simulate spatial pattern
             sp_samp.append(self._sim_spatial(geo_df))
-            t_samp.append(np.random.uniform(size=len(sp_samp[-1]))+t_lat[i])
-        sp = np.hstack([(p.x,p.y) for p in sp_samp])
-        bg = np.append(sp.T,np.hstack(t_samp).reshape(-1,1),1)
+            # Simulate event times within bin
+            t_samp.append(np.random.uniform(size=len(sp_samp[-1])) + t_lat[i])
+
+        # Stack results
+        sp = np.hstack([(p.x, p.y) for p in sp_samp])
+        bg = np.append(sp.T, np.hstack(t_samp).reshape(-1, 1), axis=1)
         return bg
+
+
+    def build_hawkes_design(
+        self, coords, t_vals, x_vals, y_vals, n_events
+    ):
+        """
+        coords: (M, 2) array of (i, j)
+        t_vals, x_vals, y_vals: (M,)
+        """
+        hawkes_i = jnp.asarray(coords[:, 0], dtype=jnp.int32)
+        hawkes_dt = jnp.asarray(t_vals)
+        hawkes_dx = jnp.asarray(x_vals)
+        hawkes_dy = jnp.asarray(y_vals)
+
+        return {
+            "hawkes_i": hawkes_i,
+            "hawkes_dt": hawkes_dt,
+            "hawkes_dx": hawkes_dx,
+            "hawkes_dy": hawkes_dy,
+            "n_events": n_events,
+        }
+
+
+    def set_window(self, window, spatial_window=None):
+        window = float(window)
+        if spatial_window is not None:
+            spatial_window = float(spatial_window)
+        print("[DEBUG] set_window called with:")
+        print("  window type:", type(window), "value:", window)
+        print("  spatial_window type:", type(spatial_window), "value:", spatial_window)
+        self.args['window'] = window
+        if spatial_window is not None:
+            self.args['spatial_window'] = spatial_window
+
+        # Recompute pairs with both windows
+        coords, t_vals, x_vals, y_vals = aligned_difference_pairs(
+            self.args['t_events'],
+            self.args['xy_events'][0],
+            self.args['xy_events'][1],
+            window=window,
+            spatial_window=spatial_window
+        )
+
+        self.args['coords'] = coords
+        self.args['t_vals'] = t_vals
+        self.args['x_vals'] = x_vals
+        self.args['y_vals'] = y_vals
+
+        n_events = self.args['t_events'].shape[0]
+        self.args['hawkes_design'] = self.build_hawkes_design(
+            coords, t_vals, x_vals, y_vals, n_events
+        )
+
+        if 'litter_t_events' in self.args:
+            litter_diff_coords, litter_diff_t_vals, litter_diff_x_vals, litter_diff_y_vals = aligned_difference_cross(
+                self.args['litter_t_events'],
+                self.args['litter_xy_events'][0],
+                self.args['litter_xy_events'][1],
+                self.args['t_vals'], self.args['x_vals'], self.args['y_vals'],
+                self.args['window'], spatial_window=self.args['spatial_window']
+            )
+            n_litter_events = self.args['litter_t_events'].shape[0]
+            self.args['litter_hawkes_design'] = self.build_hawkes_design(
+                litter_diff_coords, litter_diff_t_vals, litter_diff_x_vals, litter_diff_y_vals, n_litter_events
+            )
+
+        if 'dumping_report_t_events' in self.args:
+            dumping_diff_coords, dumping_diff_t_vals, dumping_diff_x_vals, dumping_diff_y_vals = aligned_difference_cross(
+                self.args['dumping_report_t_events'],
+                self.args['dumping_report_xy_events'][0],
+                self.args['dumping_report_xy_events'][1],
+                self.args['t_vals'], self.args['x_vals'], self.args['y_vals'],
+                self.args['window'], spatial_window=self.args['spatial_window']
+            )
+            n_dumping_report_events = self.args['dumping_report_t_events'].shape[0]
+            self.args['dumping_report_hawkes_design'] = self.build_hawkes_design(
+                dumping_diff_coords, dumping_diff_t_vals, dumping_diff_x_vals, dumping_diff_y_vals, n_dumping_report_events
+            )
+
+        # Debug prints
+        print(f"[set_window] Temporal window set to: {window}")
+        print(f"[set_window] Number of events: {self.args['t_events'].shape[0]}")
+        print(f"[set_window] Number of pairs: {coords.shape[0]}")
+
+        # Temporal window checks
+        print(f"[set_window] Max t_diff in pairs: {float(t_vals.max())}")
+        print(f"[set_window] Min t_diff in pairs: {float(t_vals.min())}")
+        print(f"[set_window] All t_diff <= window: {bool((t_vals <= window).all())}")
+        print(f"[set_window] All t_diff > 0: {bool((t_vals > 0).all())}")
+
+        # Spatial window checks (if spatial_window is set)
+        if spatial_window is not None:
+            spatial_dist = jnp.sqrt(x_vals**2 + y_vals**2)
+            print(f"[set_window] Spatial window set to: {spatial_window}")
+            print(f"[set_window] Max spatial distance: {float(spatial_dist.max())}")
+            print(f"[set_window] Min spatial distance: {float(spatial_dist.min())}")
+            print(f"[set_window] All spatial distances <= window: {bool((spatial_dist <= spatial_window).all())}")
+
+
+
+
+
+    def get_params(self):
+        pars = {}
+        pars['z_spatial'] = self.args['z_dim_spatial']
+        pars['z_temporal'] = self.args['z_dim_temporal']
+        pars['z_seasonal'] = self.args['z_dim_seasonal']
+        pars['f_xy'] = 0
+        pars['f_t'] = 0
+        pars['f_a'] = 0
+        pars['a_0'] = 1
+        if 'spatial_cov' in self.args:
+            spatial_cov = self.args['spatial_cov']
+            if spatial_cov.ndim == 1:
+                spatial_cov = spatial_cov[:, None]
+                self.args['spatial_cov'] = spatial_cov
+            pars['w'] = spatial_cov.shape[1]
+        if self.args['model'] == 'cox_hawkes':
+            pars['w_month'] = 12
+            if 'indices_d' in self.args:
+                pars['w_day'] = self.args['n_days']
+        return pars
+
 
 class Hawkes_Model(Point_Process_Model):
     def __init__(self,data, A, T, cox_background='cox',temporal_trig=Temporal_Exponential,
                  spatial_trig=Spatial_Symmetric_Gaussian,**kwargs):
         r"""
         Spatiotemporal Point Process Model given by,
-        
+
         $$\lambda(t,s) = \mu(s,t) + \sum_{i:t_i<t}{\alpha f(t-t_i;\beta) \varphi(s-s_i;\sigma^2)}$$
 
         where $f$ is defined by spatial_trig, $\\varphi$ is defined by spatial_trig. If cox_background is true, $\mu$ is given by
-        
+
         $$\mu(s,t) = exp(a_0 + X(s)w + f_s(s) + f_t(t))$$
 
-        where $X(s)$ is the spatial covariate matrix, $f_s$ and $f_t$ are Gaussian Processes. 
-        Both $f_s$ and $f_t$ are simulated by a pretrained VAE. We used a squared exponential kernel with hyperparameters $l \sim InverseGamma(15,1)$ and $\sigma^2 \sim LogNormal(2,0.5)$ 
+        where $X(s)$ is the spatial covariate matrix, $f_s$ and $f_t$ are Gaussian Processes.
+        Both $f_s$ and $f_t$ are simulated by a pretrained VAE. We used a squared exponential kernel with hyperparameters $l \sim InverseGamma(15,1)$ and $\sigma^2 \sim LogNormal(2,0.5)$
 
         Otherwise, the $\mu$ is given by
 
         $$\mu(s,t) = exp(a_0 + X(s)w)$$
-        
+
         The data is rescaled to fit in a 1x1 spatial grid and a lenght 50 time window. Posterior samples must be interpreted with this in mind.
 
         Parameters
@@ -635,14 +1453,18 @@ class Hawkes_Model(Point_Process_Model):
         else:
             name = 'hawkes'
         super().__init__(name, data, A, T, **kwargs)
-        
+
         self.args['t_trig'] = temporal_trig(self.args['priors'])
         self.args['sp_trig'] = spatial_trig(self.args['priors'])
-    
+        window = self.args.get('window', None)
+        if window is not None:
+            spatial_window = self.args.get('spatial_window', None)
+            self.set_window(float(window), float(spatial_window) if spatial_window is not None else None)
+
     def __str__(self):
         model = "Hawkes" if self.args['model'] == "hawkes" else "Cox Hawkes"
         return f"{model} Model with Covariates" if 'num_cov' in self.args else f"{model} Model without Covariates"
-        
+
     def get_params(self):
         """
         Returns
@@ -655,22 +1477,30 @@ class Hawkes_Model(Point_Process_Model):
             pars[n] = 1
         for n in self.args['sp_trig'].get_par_names():
             pars[n] = 1
-        
+
         if self.args['model'] == 'cox_hawkes':
             pars['z_spatial'] = self.args['z_dim_spatial']
             pars['z_temporal'] = self.args['z_dim_temporal']
+            pars['z_seasonal'] = self.args['z_dim_seasonal']
             pars['f_xy'] = 0
             pars['f_t'] = 0
+            pars['f_a'] = 0
+            pars['w_month'] = 12
+            if 'indices_d' in self.args:
+                pars['w_day'] = self.args['n_days']
         pars['a_0'] = 1
         if 'spatial_cov' in self.args:
-            pars['w'] = self.args['spatial_cov'].shape[1]
-            pars['b_0'] = 0
+            spatial_cov = self.args['spatial_cov']
+            if spatial_cov.ndim == 1:
+                spatial_cov = spatial_cov[:, None]
+                self.args['spatial_cov'] = spatial_cov
+            pars['w'] = spatial_cov.shape[1]
         return pars
-    
+
     def plot_prop_excitation(self):
         """
         Plots a histogram of the posterior distribution of the proportion of the intensity due to self-excitation.
-        
+
         Returns
         -------
             float: posterior mean of proportion of intensity due to self-excitation
@@ -680,7 +1510,7 @@ class Hawkes_Model(Point_Process_Model):
         plt.title("Proportion of Intensity Due to Self-Excitation")
         plt.xlabel("Proportion of Intensity Due to Self-Excitation")
         return p.mean().item()
-    
+
     def plot_trigger_posterior(self,trace=False):
         """
         Plot histograms of posterior trigger parameters.
@@ -719,40 +1549,186 @@ class Hawkes_Model(Point_Process_Model):
         trig_summary = pd.DataFrame({'Post Mean':mean,'Post Std':std,r'P(w>0)':p_val,
                       '[0.025':quantiles[0],'0.975]':quantiles[1]},index=['alpha']+par_names)
         return trig_summary
-    
-    def plot_trigger_time_decay(self,t_units='days'):
+
+    def plot_trigger_time_decay(self, t_units='days'):
         """
-        Plot temporal trigger kernel sample posterior.
+        Plot temporal trigger kernel sample posterior for a range of time lags.
+        """
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+
+        par_names = self.args['t_trig'].get_par_names()
+        scale = 50 / self.T
+
+
+        # Estimate a good maximum for t
+        post_mean = {name: self.samples[name].mean().item() for name in par_names}
+        t_max = self.args['T']
+        t_grid = np.linspace(0, t_max, 250)  # 250 time lags from 0 to T
+
+        fig, ax = plt.subplots(figsize=(7, 7))
+
+        # Plot 100 posterior samples
+        for i in np.random.choice(np.arange(len(self.samples['alpha'])), 100):
+            pars = {name: self.samples[name][i].item() for name in par_names}
+            # For each t in t_grid, create a fake (coords, t_vals) tuple
+            # coords is not used for plotting, so just use dummy indices
+            coords = np.zeros((len(t_grid), 2), dtype=int)
+            t_vals = jnp.array(t_grid)
+            _, trigger_vals = self.args['t_trig'].compute_trigger(pars, (coords, t_vals))
+            ax.plot(t_grid / scale, trigger_vals, color='black', alpha=0.1)
+
+        # Plot posterior mean
+        coords = np.zeros((len(t_grid), 2), dtype=int)
+        t_vals = jnp.array(t_grid)
+        _, mean_trigger_vals = self.args['t_trig'].compute_trigger(post_mean, (coords, t_vals))
+        ax.plot(t_grid / scale, mean_trigger_vals, color='blue', label='Posterior Mean')
+
+        fig.suptitle('Time Decay of Trigger Function')
+        ax.set_ylabel('Trigger Intensity')
+        ax.set_xlabel(f'{t_units.capitalize()} After First Event')
+        ax.axhline(0, color='black', linestyle='--')
+        ax.axvline(0, color='black', linestyle='--')
+        ax.legend()
+        plt.show()
+
+#------------------------------------------------    
+    def analyze_trigger_decay_distribution(self, n_bootstrap=100, t_units='days'):
+        """
+        Bootstrap analysis of trigger decay characteristics
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from scipy.interpolate import interp1d
         
-        Parameters
-        ----------
-        t_units: str
-            Time units of original data.
-        """
         if 'samples' not in dir(self):
             raise Exception("MCMC posterior sampling has not been performed yet.")
         
         par_names = self.args['t_trig'].get_par_names()
-        post_mean = {}
-        for name in par_names:
-            post_mean[name] = self.samples[name].mean().item()
-        scale = 50/self.T
-        #estimate a good maximum
-        t = self.args['t_trig'].compute_integral(post_mean,self.args['T']/10)
-        t = np.log(0.025)/np.log(1-t)*self.args['T']/10
-        t = np.arange(0,t,t/250)
-        fig, ax = plt.subplots(figsize=(7,7))
-        for i in np.random.choice(np.arange(len(self.samples['alpha'])),100):
-            pars = {}
-            for name in par_names:
-                pars[name] = self.samples[name][i].item()
-            plt.plot(t/scale,self.args['t_trig'].compute_trigger(pars,t),color='black',alpha=0.1)
-        fig.suptitle('Time Decay of Trigger Function')
-        ax.set_ylabel('Trigger Intensity')
-        ax.set_xlabel(t_units.capitalize()+' After First Event')
-        ax.axhline(0,color='black',linestyle='--')
-        ax.axvline(0,color='black',linestyle='--')
-    
+        scale = 50 / self.T
+        t_max = self.args['T']
+        t_grid = np.linspace(0, t_max, 250)
+        
+        # Storage for characteristics
+        half_lives = []
+        decay_constants = []
+        peak_intensities = []
+        time_to_1percent = []
+        
+        # Bootstrap sampling
+        n_samples = len(self.samples[par_names[0]])
+        bootstrap_indices = np.random.choice(n_samples, n_bootstrap, replace=True)
+        
+        for i in bootstrap_indices:
+            # Extract parameters for this sample
+            pars = {name: self.samples[name][i].item() for name in par_names}
+            
+            # Compute trigger values
+            coords = np.zeros((len(t_grid), 2), dtype=int)
+            t_vals = jnp.array(t_grid)
+            _, trigger_vals = self.args['t_trig'].compute_trigger(pars, (coords, t_vals))
+            
+            # Extract characteristics
+            trigger_vals = np.array(trigger_vals)
+            peak_intensity = np.max(trigger_vals)
+            peak_intensities.append(peak_intensity)
+            
+            # Find half-life (time to 50% of peak)
+            half_peak = peak_intensity / 2
+            if np.any(trigger_vals <= half_peak):
+                half_life_idx = np.where(trigger_vals <= half_peak)[0][0]
+                half_life = t_grid[half_life_idx] / scale
+                half_lives.append(half_life)
+            
+            # Find time to 1% of peak
+            one_percent = peak_intensity * 0.01
+            if np.any(trigger_vals <= one_percent):
+                one_percent_idx = np.where(trigger_vals <= one_percent)[0][0]
+                time_1pct = t_grid[one_percent_idx] / scale
+                time_to_1percent.append(time_1pct)
+            
+            # Estimate decay constant (fit exponential decay)
+            # Assuming exponential: f(t) = A * exp(-t/tau)
+            # We can estimate tau from the slope in log space
+            if len(trigger_vals) > 10:
+                valid_vals = trigger_vals[trigger_vals > peak_intensity * 0.01]
+                if len(valid_vals) > 5:
+                    log_vals = np.log(valid_vals)
+                    t_subset = t_grid[:len(valid_vals)] / scale
+                    if len(t_subset) > 1:
+                        # Simple linear fit to log values
+                        slope = (log_vals[-1] - log_vals[0]) / (t_subset[-1] - t_subset[0])
+                        tau = -1 / slope  # decay constant
+                        decay_constants.append(tau)
+        
+        # Create distribution plots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f'Distribution of Trigger Decay Characteristics (n={n_bootstrap} bootstrap samples)')
+        
+        # Half-life distribution
+        if half_lives:
+            axes[0,0].hist(half_lives, bins=20, alpha=0.7, edgecolor='black')
+            axes[0,0].axvline(np.mean(half_lives), color='red', linestyle='--', 
+                            label=f'Mean: {np.mean(half_lives):.1f} {t_units}')
+            axes[0,0].set_xlabel(f'Half-life ({t_units})')
+            axes[0,0].set_ylabel('Frequency')
+            axes[0,0].set_title('Half-life Distribution')
+            axes[0,0].legend()
+        
+        # Peak intensity distribution
+        if peak_intensities:
+            axes[0,1].hist(peak_intensities, bins=20, alpha=0.7, edgecolor='black')
+            axes[0,1].axvline(np.mean(peak_intensities), color='red', linestyle='--',
+                            label=f'Mean: {np.mean(peak_intensities):.3f}')
+            axes[0,1].set_xlabel('Peak Trigger Intensity')
+            axes[0,1].set_ylabel('Frequency')
+            axes[0,1].set_title('Peak Intensity Distribution')
+            axes[0,1].legend()
+        
+        # Decay constant distribution
+        if decay_constants:
+            axes[1,0].hist(decay_constants, bins=20, alpha=0.7, edgecolor='black')
+            axes[1,0].axvline(np.mean(decay_constants), color='red', linestyle='--',
+                            label=f'Mean: {np.mean(decay_constants):.1f} {t_units}')
+            axes[1,0].set_xlabel(f'Decay Constant ({t_units})')
+            axes[1,0].set_ylabel('Frequency')
+            axes[1,0].set_title('Decay Constant Distribution')
+            axes[1,0].legend()
+        
+        # Time to 1% distribution
+        if time_to_1percent:
+            axes[1,1].hist(time_to_1percent, bins=20, alpha=0.7, edgecolor='black')
+            axes[1,1].axvline(np.mean(time_to_1percent), color='red', linestyle='--',
+                            label=f'Mean: {np.mean(time_to_1percent):.1f} {t_units}')
+            axes[1,1].set_xlabel(f'Time to 1% of Peak ({t_units})')
+            axes[1,1].set_ylabel('Frequency')
+            axes[1,1].set_title('Time to Effective Zero')
+            axes[1,1].legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print summary statistics
+        print("TRIGGER DECAY CHARACTERISTICS SUMMARY:")
+        print("="*50)
+        if half_lives:
+            print(f"Half-life: {np.mean(half_lives):.1f} ± {np.std(half_lives):.1f} {t_units}")
+        if peak_intensities:
+            print(f"Peak Intensity: {np.mean(peak_intensities):.3f} ± {np.std(peak_intensities):.3f}")
+        if decay_constants:
+            print(f"Decay Constant: {np.mean(decay_constants):.1f} ± {np.std(decay_constants):.1f} {t_units}")
+        if time_to_1percent:
+            print(f"Time to 1% of Peak: {np.mean(time_to_1percent):.1f} ± {np.std(time_to_1percent):.1f} {t_units}")
+        
+        return {
+            'half_lives': half_lives,
+            'peak_intensities': peak_intensities, 
+            'decay_constants': decay_constants,
+            'time_to_1percent': time_to_1percent
+        }
+#------------------------------------------------
+
+
     def _sim_hawkes_bg(self,parameters):
         a_0 = parameters['a_0']
         if 'spatial_cov' in self.args:
@@ -765,11 +1741,11 @@ class Hawkes_Model(Point_Process_Model):
         geo_df['area'] = geo_df.area/((A_[0,1]-A_[0,0])*(A_[1,1]-A_[1,0]))
         sp = self._sim_spatial(geo_df)
         return np.stack((sp.x,sp.y,np.random.uniform(self.args['T'],size=len(sp)))).T
-    
+
     def _sim_offspring(self,bg,par):
         i = 0
         while i < len(bg):
-            for j in range(np.random.poisson(lam=par['alpha'])):
+            for j in np.random.poisson(lam=par['alpha']):
                 #simulate trigger and rescale
                 sp_dif = (self.args['A_'][:,1]-self.args['A_'][:,0])*\
                             self.args['sp_trig'].simulate_trigger(par)
@@ -787,24 +1763,29 @@ class Hawkes_Model(Point_Process_Model):
             Parameters to simulate from. If parameters is None, use mean of posterior samples. keys are string parameter names. values are np.array or float. Names must be same as those that appear in the sample from the model.
         Returns
         -------
-            geopandas DataFrame: ['X','Y','T'] columns
+            geopandas DataFrame: ['X','Y','T','A'] columns
                 simulated data
         """
         if parameters is None:
             parameters = {k:np.array(v).mean(axis=0) for k,v in self.samples.items()}
         if 'f_t' not in parameters and 'z_temporal' in parameters:
-            decoder_nn_temporal = vae_decoder_temporal(self.args["hidden_dim_temporal"], self.args["n_t"])  
+            decoder_nn_temporal = vae_decoder_temporal(self.args["hidden_dim_temporal"], self.args["n_t"])
             # Approximate Gaussian Process with VAE
             v_t = decoder_nn_temporal[1](self.args["decoder_params_temporal"], parameters['z_temporal'])
             parameters['f_t'] = v_t[0:self.args["n_t"]]
+        if 'f_a' not in parameters and 'z_seasonal' in parameters:
+            decoder_nn_seasonal = vae_decoder_seasonal(self.args["hidden_dim1_seasonal"], self.args["hidden_dim2_seasonal"], self.args["n_s"])
+            u_t = decoder_nn_seasonal[1](self.args["decoder_params_seasonal"], parameters['z_seasonal'])
+            parameters['f_a'] = u_t[0:self.args["n_s"]]
         if 'f_xy' not in parameters and 'z_spatial' in parameters:
-            decoder_nn = vae_decoder_spatial(self.args["hidden_dim2_spatial"], self.args["hidden_dim1_spatial"], self.args["n_xy"])  
+            #decoder_nn = vae_decoder_spatial(self.args["hidden_dim2_spatial"], self.args["hidden_dim1_spatial"], self.args["n_xy"])
+            decoder_nn = vae_decoder_spatial(self.args["hidden_dim1_spatial"], self.args["hidden_dim2_spatial"], self.args["n_xy"])
             decoder_params = self.args["decoder_params_spatial"]
             # Generate Gaussian Process from VAE
             parameters['f_xy'] = jnp.exp(self.args['sp_var_mu']) * decoder_nn[1](decoder_params, parameters['z_spatial'])
         if 'w' in parameters and 'b_0' not in parameters:
             parameters['b_0'] = self.args['spatial_cov'] @ parameters['w']
-        
+
         if self.args['model'] == 'cox_hawkes':
             bg = self._sim_cox(parameters)
         else:
@@ -816,18 +1797,68 @@ class Hawkes_Model(Point_Process_Model):
         points = gpd.GeoDataFrame(data=sample,geometry=geometry,columns=['X','Y','T'])
         #filter to time window
         points['T'] = (points['T']*self.T/self.args['T'])
+        points['A'] = ((points['T']*self.args['T'] + self.args['offset_seasonal']) % self.S)
         #filter to spatial window
-        return points.sjoin(self.A[['geometry']])[['X','Y','T','geometry']]
+        return points.sjoin(self.A[['geometry']])[['X','Y','T','A','geometry']]
+
+
+    def plot_day_effect(self):
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from numpyro.diagnostics import hpdi
+        import calendar
+
+        plt.close('all')
+        """
+        Plot the mean and 90% CI of the posterior daily effect (w_day).
+        The x-axis is days (1–365 or 1–366), with month names as ticks.
+        """
+        if 'samples' not in dir(self):
+            raise Exception("MCMC posterior sampling has not been performed yet.")
+        if 'w_day' not in self.samples:
+            raise Exception("No daily effects found in the model.")
+
+        # Get posterior samples for w_day
+        w_day_post = np.array(self.samples['w_day'])  # shape (num_samples, n_days)
+        w_day_mean = np.mean(w_day_post, axis=0)
+        w_day_hpdi = hpdi(w_day_post, prob=0.9)
+
+        # Day labels
+        n_days = w_day_post.shape[1]
+        days = np.arange(1, n_days + 1)
+
+        # Month tick positions and names
+        month_starts = [1]
+        for m in range(1, 12):
+            month_starts.append(month_starts[-1] + calendar.monthrange(2001, m)[1])  # 2001 is not a leap year
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+        # Create plot
+        fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+        ax.plot(days, w_day_mean, label="mean estimated $w_{day}$")
+        ax.fill_between(days, w_day_hpdi[0], w_day_hpdi[1], alpha=0.4,
+                        color="palegoldenrod", label="90% CI")
+
+        ax.set_xticks(month_starts)
+        ax.set_xticklabels(month_names, rotation=45)
+        ax.set_ylabel('$w_{day}$')
+        ax.set_xlabel('Day of Year')
+        ax.set_title('Posterior Effect for Day of Year')
+        ax.legend()
+        plt.tight_layout()
+        # Optionally: return fig
+
 
 class LGCP_Model(Point_Process_Model):
     def __init__(self,*args,**kwargs):
         r"""
         Spatiotemporal LGCP Model given by,
-        
+
         $$\lambda(t,s) = exp(a_0 + X(s)w + f_s(s) + f_t(t))$$
 
-        where $X(s)$ is the spatial covariate matrix, $f_s$ and $f_t$ are Gaussian Processes. 
-        Both $f_s$ and $f_t$ are simulated by a pretrained VAE. We used a squared exponential kernel with hyperparameters $l \sim InverseGamma(15,1)$ and $\sigma^2 \sim LogNormal(2,0.5)$ 
+        where $X(s)$ is the spatial covariate matrix, $f_s$ and $f_t$ are Gaussian Processes.
+        Both $f_s$ and $f_t$ are simulated by a pretrained VAE. We used a squared exponential kernel with hyperparameters $l \sim InverseGamma(15,1)$ and $\sigma^2 \sim LogNormal(2,0.5)$
 
         The data is rescaled to fit in a 1x1 spatial grid and a lenght 50 time window. Posterior samples must be interpreted with this in mind.
 
@@ -841,10 +1872,10 @@ class LGCP_Model(Point_Process_Model):
         name = 'lgcp'
         self.model = spatiotemporal_LGCP_model
         super().__init__(name,*args,**kwargs)
-        
+
     def __str__(self):
         return "Log Gaussian Cox Model with Covariates" if 'num_cov' in self.args else "Log Gaussian Cox Model without Covariates"
-    
+
     def get_params(self):
         """
         Returns
@@ -854,14 +1885,20 @@ class LGCP_Model(Point_Process_Model):
         pars = {}
         pars['z_spatial'] = self.args['z_dim_spatial']
         pars['z_temporal'] = self.args['z_dim_temporal']
+        pars['z_seasonal'] = self.args['z_dim_seasonal']
         pars['f_xy'] = 0
         pars['f_t'] = 0
+        pars['f_a'] = 0
         pars['a_0'] = 1
         if 'spatial_cov' in self.args:
-            pars['w'] = self.args['spatial_cov'].shape[1]
+            spatial_cov = self.args['spatial_cov']
+            if spatial_cov.ndim == 1:
+                spatial_cov = spatial_cov[:, None]
+                self.args['spatial_cov'] = spatial_cov
+            pars['w'] = spatial_cov.shape[1]
             pars['b_0'] = 0
         return pars
-    
+
     def simulate(self,parameters=None):
         """
         Simulate data from mean posterior parameters. Requires model inference.
@@ -880,4 +1917,8 @@ class LGCP_Model(Point_Process_Model):
         geometry = gpd.points_from_xy(sample.T[0], sample.T[1],crs=self.A.crs)
         points = gpd.GeoDataFrame(data=sample,geometry=geometry,columns=['X','Y','T'])
         points['T'] = (points['T']*self.T/self.args['T'])
+        #points['A'] = (((points['T']/self.args['T']) * self.T + self.args['offset_seasonal']) % 365)
+        #points['A'] = (points['T'] + self.args['offset_seasonal']) % self.S
+        points['A'] = ((points['T']*self.args['T'] + self.args['offset_seasonal']) % self.S)
+
         return points

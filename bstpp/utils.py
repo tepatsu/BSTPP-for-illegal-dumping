@@ -165,17 +165,86 @@ def find_index(events, grid):
 
   #@title
 
-def difference_matrix(a):
-    x = jnp.reshape(a, (len(a), 1))
-    x2= x- x.transpose()
-    x2trial=jnp.tril(x2)
-    return x2trial
+def difference_matrix(a, window=15):
+    x = jnp.reshape(a, (a.shape[0], 1))
+    x2 = x - x.T
+    mask = (x2 > 0) & (x2 <= window)
+    indices = jnp.where(mask)
+    values = x2[indices]
+    coords = jnp.stack(indices, axis=-1)
+    return coords, values
 
-def difference_matrix_partial(a,partial_index):
-    x = jnp.reshape(a, (len(a), 1))
-    x2= x[partial_index]- x.transpose()
-    x2trial=jnp.tril(x2)
-    return x2trial
+def difference_matrix_partial(a, partial_index, window=15):
+    x = jnp.reshape(a, (a.shape[0], 1))
+    x2 = x[partial_index] - x.T
+    mask = (x2 > 0) & (x2 <= window)
+    indices = jnp.where(mask)
+    values = x2[indices]
+    coords = jnp.stack(indices, axis=-1)
+    return coords, values
+
+def difference_pairs(a, window=15):
+    x = jnp.reshape(a, (a.shape[0], 1))
+    x2 = x - x.T
+    mask = (x2 > 0) & (x2 <= window)
+    indices = jnp.where(mask)
+    values = x2[indices]
+    coords = jnp.stack(indices, axis=-1)
+    return coords, values
+
+def difference_pairs_2d(x, y, window=15):
+    x = jnp.reshape(x, (x.shape[0], 1))
+    y = jnp.reshape(y, (y.shape[0], 1))
+    dx = x - x.T
+    dy = y - y.T
+    mask = (dx > 0) & (dx <= window)
+
+
+    
+    indices = jnp.where(mask)
+    coords = jnp.stack(indices, axis=-1)
+    dx_vals = dx[indices]
+    dy_vals = dy[indices]
+    return coords, dx_vals, dy_vals
+
+def aligned_difference_pairs(t, x, y, window, spatial_window=None):
+    print("[DEBUG] aligned_difference_pairs called with:")
+    print("  t type:", type(t), "dtype:", getattr(t, 'dtype', None), "shape:", getattr(t, 'shape', None))
+    print("  x type:", type(x), "dtype:", getattr(x, 'dtype', None), "shape:", getattr(x, 'shape', None))
+    print("  y type:", type(y), "dtype:", getattr(y, 'dtype', None), "shape:", getattr(y, 'shape', None))
+    print("  window type:", type(window), "value:", window)
+    print("  spatial_window type:", type(spatial_window), "value:", spatial_window)
+    
+    window = float(window)
+    if spatial_window is not None:
+        spatial_window = float(spatial_window)
+    
+    t = jnp.reshape(t, (t.shape[0], 1))
+    x = jnp.reshape(x, (x.shape[0], 1))
+    y = jnp.reshape(y, (y.shape[0], 1))
+    
+    t_diff = t - t.T
+    x_diff = x - x.T
+    y_diff = y - y.T
+    
+    # Temporal mask
+    t_mask = (t_diff > 0) & (t_diff <= window)
+    
+    # Spatial mask (if spatial_window is provided)
+    if spatial_window is not None:
+        # Calculate Euclidean distance in degrees
+        spatial_dist = jnp.sqrt(x_diff**2 + y_diff**2)
+        s_mask = spatial_dist <= spatial_window
+        mask = t_mask & s_mask
+    else:
+        mask = t_mask
+    
+    indices = jnp.where(mask)
+    coords = jnp.stack(indices, axis=-1)
+    t_vals = t_diff[indices]
+    x_vals = x_diff[indices]
+    y_vals = y_diff[indices]
+    return coords, t_vals, x_vals, y_vals
 
 def sq_diff(a,b):
   return np.sum((a-b)**2)
@@ -183,3 +252,58 @@ def sq_diff(a,b):
 
 def square_mean(a,b):
   return np.mean((a-b)**2)
+
+def aligned_difference_cross(
+    t_a, x_a, y_a,
+    t_b, x_b, y_b,
+    window,
+    spatial_window=None,
+):
+    # Ensure sorted B by time
+    order = jnp.argsort(t_b)
+    t_b = t_b[order]
+    x_b = x_b[order]
+    y_b = y_b[order]
+
+    coords = []
+    t_vals = []
+    x_vals = []
+    y_vals = []
+
+    for i in range(t_a.shape[0]):
+        ta = t_a[i]
+
+        # Find candidate B indices using binary search
+        lo = jnp.searchsorted(t_b, ta, side="right")
+        hi = jnp.searchsorted(t_b, ta + window, side="right")
+
+        tb = t_b[lo:hi]
+        xb = x_b[lo:hi]
+        yb = y_b[lo:hi]
+
+        dt = tb - ta
+        dx = xb - x_a[i]
+        dy = yb - y_a[i]
+
+        if spatial_window is not None:
+            keep = dx*dx + dy*dy <= spatial_window**2
+            dt = dt[keep]
+            dx = dx[keep]
+            dy = dy[keep]
+            js = jnp.arange(lo, hi)[keep]
+        else:
+            js = jnp.arange(lo, hi)
+
+        is_ = jnp.full(js.shape, i)
+
+        coords.append(jnp.stack([is_, js], axis=1))
+        t_vals.append(dt)
+        x_vals.append(dx)
+        y_vals.append(dy)
+
+    return (
+        jnp.concatenate(coords),
+        jnp.concatenate(t_vals),
+        jnp.concatenate(x_vals),
+        jnp.concatenate(y_vals),
+    )

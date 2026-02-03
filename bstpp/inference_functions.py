@@ -1,5 +1,5 @@
 import os
-import time 
+import time
 import jax
 import jax.numpy as jnp
 from jax.example_libraries.optimizers import exponential_decay, inverse_time_decay
@@ -11,100 +11,169 @@ from numpyro.infer import MCMC, NUTS, init_to_median, init_to_value, init_to_uni
 from numpyro.infer import Trace_ELBO, SVI, Predictive
 from numpyro.infer.autoguide import *
 from numpyro import optim
-from .utils import difference_matrix
+from .utils import difference_matrix, aligned_difference_pairs
 from .vae_functions import *
 
 
 def spatiotemporal_hawkes_model(args):
     # Model for Hawkes and Cox Hawkes
-    
+
+    coords = args['coords']
+    t_vals = args['t_vals']
+    x_vals = args['x_vals']
+    y_vals = args['y_vals']
     t_events=args["t_events"]
     xy_events=args["xy_events"]
     N=t_events.shape[0]
+
+    # Do NOT recompute aligned_difference_pairs here; use precomputed values from args
 
     if args['model'] == 'hawkes':
       a_0 = numpyro.sample("a_0", args['priors']['a_0'])
       if 'spatial_cov' in args:
         w = numpyro.sample("w", args['priors']['w'])
         b_0 = numpyro.deterministic("b_0", args['spatial_cov'] @ w)
+        # Use precomputed indices for event locations
+        mu_xyt = numpyro.deterministic("mu_xyt", jnp.exp(a_0 + b_0[args['cov_ind']]))
+        Itot_txy_back = numpyro.deterministic(
+            "Itot_txy_back",
+            mu_xyt @ args['cov_area'] * args['T']
+        )
+        mu_xyt_events = mu_xyt
       else:
-        b_0=0
-      mu_xyt=numpyro.deterministic("mu_xyt",jnp.exp(a_0+b_0))
-      if 'spatial_cov' in args:
-        Itot_txy_back = numpyro.deterministic("Itot_txy_back",mu_xyt@args['cov_area']*args['T'])
-        mu_xyt_events = mu_xyt[args["cov_ind"]]
-      else:
-        Itot_txy_back = numpyro.deterministic("Itot_txy_back",mu_xyt*args['T']*args['A_area'])
+        b_0 = 0
+        mu_xyt = numpyro.deterministic("mu_xyt", jnp.exp(a_0 + b_0))
+        Itot_txy_back = numpyro.deterministic(
+            "Itot_txy_back",
+            mu_xyt * args['T'] * args['A_area']
+        )
         mu_xyt_events = mu_xyt
 
     ####### LGCP BACKGROUND
     if args['model']=='cox_hawkes':
       # Intercept of linear combination
       a_0 = numpyro.sample("a_0", args['priors']['a_0'])
-      
+
       # Generate gaussian vector to feed into VAE
-      z_temporal = numpyro.sample("z_temporal", 
-                                  dist.Normal(jnp.zeros(args["z_dim_temporal"]), 
-                                              jnp.ones(args["z_dim_temporal"]))
-                                 )
-      decoder_nn_temporal = vae_decoder_temporal(args["hidden_dim_temporal"], args["n_t"])  
+      z_temporal = numpyro.sample("z_temporal",
+        dist.Normal(jnp.zeros(args["z_dim_temporal"]), jnp.ones(args["z_dim_temporal"]))
+      )
+      decoder_nn_temporal = vae_decoder_temporal(
+        args["hidden_dim_temporal"],
+        args["n_t"]
+      )
       decoder_params = args["decoder_params_temporal"]
       # Approximate Gaussian Process with VAE
       v_t = numpyro.deterministic("v_t", decoder_nn_temporal[1](decoder_params, z_temporal))
       f_t = numpyro.deterministic("f_t", v_t[0:args["n_t"]])
-      rate_t = numpyro.deterministic("rate_t",jnp.exp(f_t+a_0))
+      rate_t = numpyro.deterministic("rate_t",jnp.exp(f_t + a_0))
       # calculate temporal integral over LGCP
       Itot_t=numpyro.deterministic("Itot_t", jnp.sum(rate_t)/args["n_t"]*args["T"])
       # Temporal part of log(mu(t,s))
       f_t_events=f_t[args["indices_t"]]
 
+      # seasonal part of log(mu(t,s))
+      z_seasonal = numpyro.sample("z_seasonal",
+        dist.Normal(jnp.zeros(args["z_dim_seasonal"]), jnp.ones(args["z_dim_seasonal"]))
+      )
+      #z_seasonal = jnp.append(z_seasonal, z_seasonal[0])
+      decoder_nn_seasonal = vae_decoder_seasonal(
+        args["hidden_dim1_seasonal"],
+        args["hidden_dim2_seasonal"],
+        args["n_s"]
+      )
+      decoder_params = args["decoder_params_seasonal"]
+      # Approximate Gaussian Process with VAE
+      v_a = numpyro.deterministic("v_a", decoder_nn_seasonal[1](decoder_params, z_seasonal))
+      f_a = numpyro.deterministic("f_a", v_a[0:args["n_s"]])
+      rate_a = numpyro.deterministic("rate_a",jnp.exp(f_a))
+      # calculate integral over LGCP
+      Itot_a = numpyro.deterministic("Itot_a", jnp.sum(rate_a)/args["n_s"]*args["S"])
+      f_a_events = f_a[args["indices_a"]]
+
       # Generate gaussian vector to feed into VAE
-      z_spatial = numpyro.sample("z_spatial", dist.Normal(jnp.zeros(args["z_dim_spatial"]), jnp.ones(args["z_dim_spatial"])))
-      decoder_nn = vae_decoder_spatial(args["hidden_dim2_spatial"], args["hidden_dim1_spatial"], args["n_xy"])  
+      z_spatial = numpyro.sample("z_spatial",
+        dist.Normal(jnp.zeros(args["z_dim_spatial"]), jnp.ones(args["z_dim_spatial"]))
+      )
+      #decoder_nn = vae_decoder_spatial(args["hidden_dim2_spatial"], args["hidden_dim1_spatial"], args["n_xy"])
+      decoder_nn = vae_decoder_spatial(
+        args["hidden_dim1_spatial"],
+        args["hidden_dim2_spatial"],
+        args["n_xy"]
+      )
       decoder_params = args["decoder_params_spatial"]
       # Generate Gaussian Process from VAE
       f_xy = numpyro.deterministic("f_xy", jnp.exp(args['sp_var_mu']) * decoder_nn[1](decoder_params, z_spatial))
       f_xy_events=f_xy[args["indices_xy"]]
-      
+
       # Calculate spatial intensity
       if 'spatial_cov' in args:
+          spatial_cov = args['spatial_cov']
+          if spatial_cov.ndim == 1:
+              spatial_cov = spatial_cov[:, None]
+          args['spatial_cov'] = spatial_cov
           # weights for linear combination
           w = numpyro.sample("w", args['priors']['w'])
           b_0 = numpyro.deterministic("b_0", args['spatial_cov'] @ w)
-          
+
           f_xy_events = f_xy_events + b_0[args['cov_ind']]
-          spatial_integral = jnp.exp(b_0[args['int_df']['cov_ind'].values] + 
+          spatial_integral = jnp.exp(b_0[args['int_df']['cov_ind'].values] +
                                      f_xy[args['int_df']['comp_grid_id'].values]) @ args['int_df']['area'].values
       else:
           rate_xy = numpyro.deterministic("rate_xy",jnp.exp(f_xy))
           spatial_integral = jnp.sum(rate_xy[args['spatial_grid_cells']])/args['n_xy']**2
       Itot_xy=numpyro.deterministic("Itot_xy", spatial_integral)
-      
-      #Calculate total background integral
-      Itot_txy_back=numpyro.deterministic("Itot_txy_back",Itot_t*Itot_xy)
 
+      #Calculate total background integral
+      Itot_txy_back=numpyro.deterministic("Itot_txy_back", Itot_t * Itot_a * Itot_xy)
+      #Itot_txy_back=numpyro.deterministic("Itot_txy_back",Itot_a*Itot_xy)
+
+      ## Replace month effect with day GP
+      ## Sample a weight for each day
+      #w_day = numpyro.sample("w_day", dist.Normal(jnp.zeros(365), jnp.ones(365)))
+      ## One-hot encode the day indices for each event
+      #day_onehot = jax.nn.one_hot(args['indices_d'], 365)
+      ## Compute the day effect for each event
+      #day_effect = (day_onehot * w_day).sum(-1)
+      ## Add to your log-intensity
+      #f_t_events = f_t_events + day_effect
 
     #### EXPONENTIAL KERNEL for the excitation part
     #alpha is the reproduction rate
     alpha = numpyro.sample("alpha", args['priors']['alpha'])
-    
-    #spatial gaussian kernel parameters     
+
+    #spatial gaussian kernel parameters
     t_pars = args['t_trig'].sample_parameters()
     sp_pars = args['sp_trig'].sample_parameters()
-    
-    T,x_min,x_max,y_min,y_max = args['T'],args['x_min'],args['x_max'],args['y_min'],args['y_max']  
-    
-    T_diff=difference_matrix(t_events);
-    S_mat_x = difference_matrix(xy_events[0])
-    S_mat_y = difference_matrix(xy_events[1])
-    l_hawkes_sum = args['t_trig'].compute_trigger(t_pars,T_diff)*\
-                args['sp_trig'].compute_trigger(sp_pars,jnp.stack((S_mat_x,S_mat_y)))
-    l_hawkes = numpyro.deterministic('l_hawkes',alpha*jnp.sum(jnp.tril(l_hawkes_sum,-1),1))
+
+    T,x_min,x_max,y_min,y_max = args['T'],args['x_min'],args['x_max'],args['y_min'],args['y_max']
+
+    #coords, t_vals, x_vals, y_vals = aligned_difference_pairs(t_events, xy_events[0], xy_events[1], window=15)
+    args['coords'] = coords
+    args['t_vals'] = t_vals
+    args['x_vals'] = x_vals
+    args['y_vals'] = y_vals
+
+    # Temporal trigger: use coords and t_vals
+    _, t_trigger_vals = args['t_trig'].compute_trigger(t_pars, (coords, t_vals))
+
+    # Spatial trigger: use coords, x_vals, y_vals
+    _, s_trigger_vals = args['sp_trig'].compute_trigger(sp_pars, (coords, x_vals, y_vals))
+
+    # Multiply only the values (they are aligned by coords)
+    l_hawkes_vals = t_trigger_vals * s_trigger_vals
+
+    # Aggregate by row (i)
+    n = t_events.shape[0]
+    l_hawkes_sum = jax.ops.segment_sum(l_hawkes_vals, coords[:, 0], n)
+    l_hawkes = numpyro.deterministic('l_hawkes', alpha * l_hawkes_sum)
 
     if args['model'] == 'hawkes':
       ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+mu_xyt_events)))
     elif args['model']=='cox_hawkes':
-      ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+jnp.exp(a_0 + f_t_events+f_xy_events))))
+      ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+jnp.exp(a_0 + f_t_events + f_a_events + f_xy_events))))
+      #ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+jnp.exp(f_t_events + f_a_events + f_xy_events))))
+      #ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+jnp.exp(a_0 + f_a_events + f_xy_events))))
 
     #### hawkes integral
     temp_part = alpha*args['t_trig'].compute_integral(t_pars,T-t_events)
@@ -113,15 +182,15 @@ def spatiotemporal_hawkes_model(args):
     sp_limits = jnp.stack((x_max-xy_events[0],xy_events[0]-x_min,
                            y_max-xy_events[1],xy_events[1]-y_min)
                          ).reshape(2,2,-1)
-    
+
     sp_part = args['sp_trig'].compute_integral(sp_pars,sp_limits)
-    
+
     Itot_excite = numpyro.deterministic("Itot_excite",jnp.sum(temp_part*sp_part))
     ## total integral
-    Itot_txy = numpyro.deterministic("Itot_txy",Itot_excite+Itot_txy_back)
+    Itot_txy = numpyro.deterministic("Itot_txy",Itot_excite + Itot_txy_back)
     loglik=numpyro.deterministic('loglik',ell_1-Itot_txy)
 
-    numpyro.factor("t_events", loglik) 
+    numpyro.factor("t_events", loglik)
     numpyro.factor("xy_events", loglik)
 
 
@@ -129,44 +198,68 @@ def spatiotemporal_LGCP_model(args):
     t_events=args["t_events"];
     xy_events=args["xy_events"];
     n_obs=t_events.shape[0]
-    
+
     #temporal rate
     a_0 = numpyro.sample("a_0", args['priors']['a_0'])
-    
-    #zero mean temporal gp 
+
+    #zero mean temporal gp
     z_temporal = numpyro.sample("z_temporal", dist.Normal(jnp.zeros(args["z_dim_temporal"]), jnp.ones(args["z_dim_temporal"])))
-    decoder_nn_temporal = vae_decoder_temporal(args["hidden_dim_temporal"], args["n_t"])  
+    decoder_nn_temporal = vae_decoder_temporal(args["hidden_dim_temporal"], args["n_t"])
     decoder_params = args["decoder_params_temporal"]
     v_t = numpyro.deterministic("v_t", decoder_nn_temporal[1](decoder_params, z_temporal))
     f_t = numpyro.deterministic("f_t", v_t[0:args["n_t"]])
+    # --- Add month covariate effect ---
+    #w_month = numpyro.sample("w_month", dist.Normal(jnp.zeros(12), jnp.ones(12)))
+    #month_onehot = jax.nn.one_hot(args['month_indices'] - 1, 12)
+    #month_effect = (month_onehot * w_month).sum(-1)
+    #f_t_i=f_t[args["indices_t"]] + month_effect
     rate_t = numpyro.deterministic("rate_t",jnp.exp(f_t+a_0))
     Itot_t=numpyro.deterministic("Itot_t", jnp.sum(rate_t)/args["n_t"]*args["T"])
-    f_t_i=f_t[args["indices_t"]]
-    
+
+    # seasonal part of log(mu(t,s))
+    z_seasonal = numpyro.sample("z_seasonal",
+                              dist.Normal(jnp.zeros(args["z_dim_seasonal"]),
+                                          jnp.ones(args["z_dim_seasonal"]))
+                             )
+    decoder_nn_seasonal = vae_decoder_seasonal(args["hidden_dim1_seasonal"], args["hidden_dim2_seasonal"], args["n_s"])
+    decoder_params = args["decoder_params_seasonal"]
+    # Approximate Gaussian Process with VAE
+    v_a = numpyro.deterministic("v_a", decoder_nn_seasonal[1](decoder_params, z_seasonal))
+    f_a = numpyro.deterministic("f_a", v_a[0:args["n_s"]])
+    rate_a = numpyro.deterministic("rate_a",jnp.exp(f_a))
+    # calculate temporal integral over LGCP
+    Itot_a = numpyro.deterministic("Itot_a", jnp.sum(rate_a)/args["n_s"]*args["S"])
+
     # zero mean spatial gp
     z_spatial = numpyro.sample("z_spatial", dist.Normal(jnp.zeros(args["z_dim_spatial"]), jnp.ones(args["z_dim_spatial"])))
-    decoder_nn = vae_decoder_spatial(args["hidden_dim2_spatial"], args["hidden_dim1_spatial"], args["n_xy"])  
+    #decoder_nn = vae_decoder_spatial(args["hidden_dim2_spatial"], args["hidden_dim1_spatial"], args["n_xy"])
+    decoder_nn = vae_decoder_spatial(args["hidden_dim1_spatial"], args["hidden_dim2_spatial"], args["n_xy"])
     decoder_params = args["decoder_params_spatial"]
     f_xy = numpyro.deterministic("f_xy", jnp.exp(args['sp_var_mu']) * decoder_nn[1](decoder_params, z_spatial))
     rate_xy = numpyro.deterministic("rate_xy",jnp.exp(f_xy))
     f_xy_i=f_xy[args["indices_xy"]]
-    
+
     if 'spatial_cov' in args:
         # weights for linear combination
         w = numpyro.sample("w", args['priors']['w'])
         b_0 = numpyro.deterministic("b_0", args['spatial_cov'] @ w)
-        f_xy_i += b_0[args['cov_ind']]
-        spatial_integral = jnp.exp(b_0[args['int_df']['cov_ind'].values] +
-                                   f_xy[args['int_df']['comp_grid_id'].values]
-                                  ) @ args['int_df']['area'].values
+        # Use precomputed indices for event locations
+        f_xy_i = f_xy[args["indices_xy"]] + b_0[args['cov_ind']]
+        spatial_integral = jnp.exp(
+            b_0[args['int_df']['cov_ind'].values] +
+            f_xy[args['int_df']['comp_grid_id'].values]
+        ) @ args['int_df']['area'].values
     else:
-        spatial_integral = jnp.sum(rate_xy[args['spatial_grid_cells']])/args['n_xy']**2
-    
-    Itot_xy=numpyro.deterministic("Itot_xy", spatial_integral)
-    
+        f_xy_i = f_xy[args["indices_xy"]]
+        spatial_integral = jnp.sum(rate_xy[args['spatial_grid_cells']]) / args['n_xy'] ** 2
 
-    loglik=jnp.sum(f_t_i+f_xy_i+a_0)
-    I_tot_txy=numpyro.deterministic("I_tot_txy",Itot_xy*Itot_t)
+    Itot_xy=numpyro.deterministic("Itot_xy", spatial_integral)
+
+
+    #loglik=jnp.sum(f_t_i+f_xy_i+a_0)
+    loglik=jnp.sum(f_a + f_t + 
+    _i + a_0)
+    I_tot_txy=numpyro.deterministic("I_tot_txy",Itot_xy * Itot_t * Itot_a)
     loglik-=I_tot_txy
     numpyro.deterministic("loglik",loglik)
 
@@ -192,13 +285,15 @@ def run_mcmc(rng_key, model_mcmc, args):
     print("\nMCMC elapsed time:", time.time() - start)
     return mcmc
 
-def get_samples(rng_key,model,guide,svi_result,args,sites):
-    predictive = Predictive(model, guide=guide, params=svi_result.params, 
-                            return_sites = sites,
-                            num_samples=args["num_samples"], 
-                            parallel = True
-                           )
-    print("Sampling Posterior...")
+def get_samples(rng_key, model, guide, svi_result, args, sites):
+    predictive = Predictive(model, guide=guide, params=svi_result.params,
+                            return_sites=sites,
+                            num_samples=args["num_samples"],
+                            # original: True
+                            parallel=True)
+    print("Number of posterior samples:", args["num_samples"])
+    print("Number of pairs:", args['coords'].shape[0])
+    print("coords shape:", args['coords'].shape)
     posterior_samples = predictive(rng_key, args=args)
     return posterior_samples
 
@@ -211,4 +306,4 @@ def run_SVI(rng_key, model, args, num_steps, lr, sites, auto_guide = AutoMultiva
     svi_result = svi.run(rng_key, num_steps, args, stable_update=True, init_state=init_state)
     posterior_samples = get_samples(rng_key,model,guide,svi_result,args,sites)
     print("\nSVI elapsed time:", time.time() - start)
-    return svi,svi_result,posterior_samples
+    return svi,svi_result ,posterior_samples
