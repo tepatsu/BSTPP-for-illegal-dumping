@@ -180,7 +180,8 @@ def spatiotemporal_hawkes_model(args):
       #ell_1=numpyro.deterministic('ell_1',jnp.sum(jnp.log(l_hawkes+jnp.exp(a_0 + f_a_events + f_xy_events))))
 
     #### hawkes integral
-    temp_part = alpha*args['t_trig'].compute_integral(t_pars,T-t_events)
+    w = args.get('window', T)
+    temp_part = alpha*args['t_trig'].compute_integral(t_pars, jnp.minimum(T - t_events, w))
 
 
     sp_limits = jnp.stack((x_max-xy_events[0],xy_events[0]-x_min,

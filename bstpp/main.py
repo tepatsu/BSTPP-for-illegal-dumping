@@ -1361,7 +1361,7 @@ class Point_Process_Model:
 
 class Hawkes_Model(Point_Process_Model):
     def __init__(self,data, A, T, cox_background='cox',temporal_trig=Temporal_Exponential,
-                 spatial_trig=Spatial_Symmetric_Gaussian,**kwargs):
+                 spatial_trig=Spatial_Symmetric_Gaussian,window=None,spatial_window=None,**kwargs):
         r"""
         Spatiotemporal Point Process Model given by,
 
@@ -1394,6 +1394,19 @@ class Hawkes_Model(Point_Process_Model):
             an implementation of Trigger to parameterize the temporal triggering mechanism.
         spatial_trig: class Trigger
             an implementation of Trigger to parameterize the spatial triggering mechanism.
+        window: float, optional
+            Temporal truncation window for the self-excitation kernel, in the internal
+            rescaled time units (data time is rescaled to [0, 50]). Excitation pairs with
+            dt > window are dropped from the sum, and the excitation integral is truncated
+            to match -- this is the exact likelihood of the truncated-kernel model. window
+            must comfortably exceed the posterior temporal scale beta (rule of thumb:
+            window >= 5*beta) or be left at the default. Defaults to T, i.e. the full
+            window / no truncation, which exactly reproduces the previous likelihood.
+        spatial_window: float, optional
+            Spatial truncation radius for excitation pairs, in the rescaled spatial units
+            (the [0, 1] square). KNOWN APPROXIMATION: this truncates pairs spatially WITHOUT
+            a matching truncation of the spatial integral, so it does not yield an exact
+            likelihood; leave it None for calibration/SBC work. Defaults to None.
         kwargs: dict
             parameters from Point_Process_Model
         """
@@ -1406,10 +1419,10 @@ class Hawkes_Model(Point_Process_Model):
 
         self.args['t_trig'] = temporal_trig(self.args['priors'])
         self.args['sp_trig'] = spatial_trig(self.args['priors'])
-        window = self.args.get('window', None)
-        if window is not None:
-            spatial_window = self.args.get('spatial_window', None)
-            self.set_window(float(window), float(spatial_window) if spatial_window is not None else None)
+        if window is None:
+            window = float(self.args['T'])   # exact likelihood: no truncation
+        self.set_window(float(window),
+                        float(spatial_window) if spatial_window is not None else None)
 
     def __str__(self):
         model = "Hawkes" if self.args['model'] == "hawkes" else "Cox Hawkes"
