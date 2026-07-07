@@ -488,7 +488,7 @@ class Point_Process_Model:
             test_args.pop(k, None)
 
         print("Final test_args keys:", list(test_args.keys()))
-        post_loglik = log_likelihood(self.model, self.samples, test_args)["t_events"]
+        post_loglik = log_likelihood(self.model, self.samples, test_args)["loglik_factor"]
         exp_log_density = logsumexp(post_loglik, axis=0) - jnp.log(jnp.shape(post_loglik)[0])
         return exp_log_density.sum().item()
 

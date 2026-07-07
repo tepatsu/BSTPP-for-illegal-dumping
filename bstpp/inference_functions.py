@@ -190,8 +190,7 @@ def spatiotemporal_hawkes_model(args):
     Itot_txy = numpyro.deterministic("Itot_txy",Itot_excite + Itot_txy_back)
     loglik=numpyro.deterministic('loglik',ell_1-Itot_txy)
 
-    numpyro.factor("t_events", loglik)
-    numpyro.factor("xy_events", loglik)
+    numpyro.factor("loglik_factor", loglik)
 
 
 def spatiotemporal_LGCP_model(args):
@@ -263,8 +262,7 @@ def spatiotemporal_LGCP_model(args):
     loglik-=I_tot_txy
     numpyro.deterministic("loglik",loglik)
 
-    numpyro.factor("t_events", loglik)
-    numpyro.factor("xy_events", loglik)
+    numpyro.factor("loglik_factor", loglik)
 
 
 def run_mcmc(rng_key, model_mcmc, args):
