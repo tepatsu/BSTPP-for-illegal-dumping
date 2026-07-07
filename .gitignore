@@ -5,6 +5,9 @@ output/
 BSTPP.egg*/
 dist/
 **/*.pkl
+# ...but the trained VAE decoders shipped with the package must be tracked
+# (bstpp/main.py loads them at model construction, e.g. 2d_decoder_15_5_large.pkl).
+!bstpp/decoders/*.pkl
 **/.ipynb_checkpoints/
 html/
 doc_temp/

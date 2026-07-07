@@ -427,10 +427,10 @@ class Point_Process_Model:
 
         #scale spatial events
         x_range = args['A_'][0]
-        x_events_total=(data['X']-x_range[0]).to_numpy()
+        x_events_total=(data['X']-x_range[0]).to_numpy(copy=True)
         x_events_total/=(x_range[1]-x_range[0])
         y_range = args['A_'][1]
-        y_events_total=(data['Y']-y_range[0]).to_numpy()
+        y_events_total=(data['Y']-y_range[0]).to_numpy(copy=True)
         y_events_total/=(y_range[1]-y_range[0])
 
         xy_events_total=np.array((x_events_total,y_events_total)).transpose()
@@ -1495,6 +1495,10 @@ class Hawkes_Model(Point_Process_Model):
                 spatial_cov = spatial_cov[:, None]
                 self.args['spatial_cov'] = spatial_cov
             pars['w'] = spatial_cov.shape[1]
+            # b_0 = X(s)w is a deterministic site; request it (value 0 so it does
+            # not count toward AIC k) so plot_spatial(include_cov=True) can read it.
+            # Was dropped from this method in the fork; LGCP_Model.get_params keeps it.
+            pars['b_0'] = 0
         return pars
 
     def plot_prop_excitation(self):
