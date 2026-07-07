@@ -1,0 +1,30 @@
+# Training metadata for bstpp/decoders/decoder_1d_T24_circ_small_l8
+#
+# STUB SIDECAR. The architecture fields below are DERIVED from bstpp/main.py
+# (Point_Process_Model.__init__ seasonal VAE args). The training-time GP-prior
+# fields are UNKNOWN and must be filled in by whoever trained this decoder --
+# do not treat the UNKNOWN entries as facts.
+#
+# Role: VAE decoder approximating a 1-D circular (periodic) Gaussian process over
+# the seasonal axis; loaded as args["decoder_params_seasonal"] and consumed by
+# vae_decoder_seasonal(hidden_dim1, hidden_dim2, n_s).
+
+# --- Architecture (derived from code) ---
+decoder_type: seasonal, 1-D, periodic/circular
+out_dim (n_s / seasonal bins): 24
+hidden_dim1: 24
+hidden_dim2: 12
+z_dim: 8
+
+# --- GP prior used to generate training draws (UNKNOWN -- fill in) ---
+kernel: UNKNOWN            # filename token "circ" implies a circular/periodic kernel; exact form not in repo
+length_scale: UNKNOWN      # filename token "l8" is ambiguous (length vs. latent); do not assume
+var_loc: UNKNOWN
+var_scale: UNKNOWN
+standardized_training_draws: UNKNOWN
+
+# --- Provenance ---
+# Not reproducible from VAE_Train.py as shipped: that script's defaults
+# (hidden_dim1=45, hidden_dim2=30, z_dim=15, exp_sq_kernel, length_scale=15) do not
+# match this decoder, and it has no circular-kernel option. This artifact was trained
+# by a separate/modified script that is not in this repository.

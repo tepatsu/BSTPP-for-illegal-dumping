@@ -36,6 +36,24 @@ from .vae_functions import *
 from .utils import aligned_difference_pairs
 
 
+def _load_decoder(name):
+    # pkgutil.get_data returns None for a missing resource in a zipped/installed
+    # package (which would then blow up as a TypeError inside pickle.loads), but
+    # raises FileNotFoundError/OSError when running from a source tree. Handle both
+    # so a missing artifact always surfaces as the actionable message below.
+    try:
+        raw = pkgutil.get_data(__name__, f"decoders/{name}")
+    except (FileNotFoundError, OSError):
+        raw = None
+    if raw is None:
+        raise FileNotFoundError(
+            f"Decoder artifact 'bstpp/decoders/{name}' is missing from the package. "
+            "Train it with VAE_Train.py and commit the pickle together with a sidecar "
+            f"'{name}.meta.txt' recording kernel, length_scale, var_loc/var_scale, "
+            "z_dim/hidden dims, and whether training draws were standardized.")
+    return pickle.loads(raw)
+
+
 def load_Boko_Haram():
     """
     Load Boko Haram dataset
@@ -231,15 +249,15 @@ class Point_Process_Model:
             args["hidden_dim2_spatial"]= 50
             args["z_dim_spatial"]=20
 
-            decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/decoder_1d_T50_fixed_ls"))
+            decoder_params = _load_decoder("decoder_1d_T50_fixed_ls")
             args["decoder_params_temporal"] = decoder_params
 
             # load decoder for seasonal
-            decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/decoder_1d_T24_circ_small_l8"))
+            decoder_params = _load_decoder("decoder_1d_T24_circ_small_l8")
             args["decoder_params_seasonal"] = decoder_params
 
             #Load 2d spatial trained decoder
-            decoder_params = pickle.loads(pkgutil.get_data(__name__, "decoders/2d_decoder_15_5_large.pkl"))
+            decoder_params = _load_decoder("2d_decoder_15_5_large.pkl")
             args["decoder_params_spatial"] = decoder_params
 
         if spatial_cov is not None:
