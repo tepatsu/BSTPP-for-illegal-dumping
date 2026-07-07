@@ -291,9 +291,9 @@ def get_samples(rng_key, model, guide, svi_result, args, sites):
                             num_samples=args["num_samples"],
                             # original: True
                             parallel=True)
-    print("Number of posterior samples:", args["num_samples"])
-    print("Number of pairs:", args['coords'].shape[0])
-    print("coords shape:", args['coords'].shape)
+    if 'coords' in args:
+        print("Number of posterior samples:", args["num_samples"])
+        print("Number of pairs:", args['coords'].shape[0])
     posterior_samples = predictive(rng_key, args=args)
     return posterior_samples
 

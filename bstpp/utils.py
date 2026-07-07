@@ -208,13 +208,6 @@ def difference_pairs_2d(x, y, window=15):
     return coords, dx_vals, dy_vals
 
 def aligned_difference_pairs(t, x, y, window, spatial_window=None):
-    print("[DEBUG] aligned_difference_pairs called with:")
-    print("  t type:", type(t), "dtype:", getattr(t, 'dtype', None), "shape:", getattr(t, 'shape', None))
-    print("  x type:", type(x), "dtype:", getattr(x, 'dtype', None), "shape:", getattr(x, 'shape', None))
-    print("  y type:", type(y), "dtype:", getattr(y, 'dtype', None), "shape:", getattr(y, 'shape', None))
-    print("  window type:", type(window), "value:", window)
-    print("  spatial_window type:", type(spatial_window), "value:", spatial_window)
-    
     window = float(window)
     if spatial_window is not None:
         spatial_window = float(spatial_window)

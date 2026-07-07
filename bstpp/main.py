@@ -1312,9 +1312,6 @@ class Point_Process_Model:
         window = float(window)
         if spatial_window is not None:
             spatial_window = float(spatial_window)
-        print("[DEBUG] set_window called with:")
-        print("  window type:", type(window), "value:", window)
-        print("  spatial_window type:", type(spatial_window), "value:", spatial_window)
         self.args['window'] = window
         if spatial_window is not None:
             self.args['spatial_window'] = spatial_window
@@ -1363,25 +1360,6 @@ class Point_Process_Model:
             self.args['dumping_report_hawkes_design'] = self.build_hawkes_design(
                 dumping_diff_coords, dumping_diff_t_vals, dumping_diff_x_vals, dumping_diff_y_vals, n_dumping_report_events
             )
-
-        # Debug prints
-        print(f"[set_window] Temporal window set to: {window}")
-        print(f"[set_window] Number of events: {self.args['t_events'].shape[0]}")
-        print(f"[set_window] Number of pairs: {coords.shape[0]}")
-
-        # Temporal window checks
-        print(f"[set_window] Max t_diff in pairs: {float(t_vals.max())}")
-        print(f"[set_window] Min t_diff in pairs: {float(t_vals.min())}")
-        print(f"[set_window] All t_diff <= window: {bool((t_vals <= window).all())}")
-        print(f"[set_window] All t_diff > 0: {bool((t_vals > 0).all())}")
-
-        # Spatial window checks (if spatial_window is set)
-        if spatial_window is not None:
-            spatial_dist = jnp.sqrt(x_vals**2 + y_vals**2)
-            print(f"[set_window] Spatial window set to: {spatial_window}")
-            print(f"[set_window] Max spatial distance: {float(spatial_dist.max())}")
-            print(f"[set_window] Min spatial distance: {float(spatial_dist.min())}")
-            print(f"[set_window] All spatial distances <= window: {bool((spatial_dist <= spatial_window).all())}")
 
 
 
