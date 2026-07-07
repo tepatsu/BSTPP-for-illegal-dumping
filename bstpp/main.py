@@ -224,6 +224,13 @@ class Point_Process_Model:
         self.comp_grid = comp_grid
         self.T = T
 
+        # Seasonal index of each temporal grid cell midpoint (diagonal a = sigma(t)):
+        # internal cell i covers real days [i, i+1) * (T / n_t); map its midpoint through
+        # day-of-year (mod self.S) onto the internal seasonal grid [0, args['S']).
+        t_mid_days = (np.arange(n_t) + 0.5) * (T / n_t)
+        a_mid = ((t_mid_days + offset_seasonal) % self.S) / self.S * args['S']
+        args['season_idx_of_t'] = np.searchsorted(np.asarray(x_a), a_mid, side='right') - 1
+
         args,points = self._scale_xyt(data,args,comp_grid)
         self.points = points
 
