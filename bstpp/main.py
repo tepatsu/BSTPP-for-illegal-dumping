@@ -1323,10 +1323,9 @@ class Point_Process_Model:
                 spatial_cov = spatial_cov[:, None]
                 self.args['spatial_cov'] = spatial_cov
             pars['w'] = spatial_cov.shape[1]
-        if self.args['model'] == 'cox_hawkes':
-            pars['w_month'] = 12
-            if 'indices_d' in self.args:
-                pars['w_day'] = self.args['n_days']
+        # Convention: VAE latent dims (z_spatial/z_temporal/z_seasonal) are counted in k,
+        # so absolute AIC is penalized for latent variables; only relative AIC comparisons
+        # under the same convention are meaningful.
         return pars
 
 
@@ -1419,9 +1418,6 @@ class Hawkes_Model(Point_Process_Model):
             pars['f_xy'] = 0
             pars['f_t'] = 0
             pars['f_a'] = 0
-            pars['w_month'] = 12
-            if 'indices_d' in self.args:
-                pars['w_day'] = self.args['n_days']
         pars['a_0'] = 1
         if 'spatial_cov' in self.args:
             spatial_cov = self.args['spatial_cov']
@@ -1433,6 +1429,9 @@ class Hawkes_Model(Point_Process_Model):
             # not count toward AIC k) so plot_spatial(include_cov=True) can read it.
             # Was dropped from this method in the fork; LGCP_Model.get_params keeps it.
             pars['b_0'] = 0
+        # Convention: VAE latent dims (z_spatial/z_temporal/z_seasonal) are counted in k,
+        # so absolute AIC is penalized for latent variables; only relative AIC comparisons
+        # under the same convention are meaningful.
         return pars
 
     def plot_prop_excitation(self):
@@ -1838,6 +1837,9 @@ class LGCP_Model(Point_Process_Model):
                 self.args['spatial_cov'] = spatial_cov
             pars['w'] = spatial_cov.shape[1]
             pars['b_0'] = 0
+        # Convention: VAE latent dims (z_spatial/z_temporal/z_seasonal) are counted in k,
+        # so absolute AIC is penalized for latent variables; only relative AIC comparisons
+        # under the same convention are meaningful.
         return pars
 
     def simulate(self,parameters=None):
