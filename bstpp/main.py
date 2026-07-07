@@ -1721,12 +1721,12 @@ class Hawkes_Model(Point_Process_Model):
         A_ = self.args['A_']
         geo_df['area'] = geo_df.area/((A_[0,1]-A_[0,0])*(A_[1,1]-A_[1,0]))
         sp = self._sim_spatial(geo_df)
-        return np.stack((sp.x,sp.y,np.random.uniform(self.args['T'],size=len(sp)))).T
+        return np.stack((sp.x,sp.y,np.random.uniform(0, self.args['T'],size=len(sp)))).T
 
     def _sim_offspring(self,bg,par):
         i = 0
         while i < len(bg):
-            for j in np.random.poisson(lam=par['alpha']):
+            for j in range(np.random.poisson(lam=par['alpha'])):
                 #simulate trigger and rescale
                 sp_dif = (self.args['A_'][:,1]-self.args['A_'][:,0])*\
                             self.args['sp_trig'].simulate_trigger(par)
