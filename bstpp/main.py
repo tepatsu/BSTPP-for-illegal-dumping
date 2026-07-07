@@ -1233,97 +1233,54 @@ class Point_Process_Model:
         samples = geo_df[mask_zero].sample_points(size=num_samp[mask_zero])
         return samples.explode(index_parts=False)
 
-#    def _sim_cox(self,parameters):
-#        if 'spatial_cov' in self.args:
-#            geo_df = self.args['int_df']
-#            geo_df['spatial_log_intensity'] = (parameters['b_0'][geo_df['cov_ind'].values] +
-#                                   parameters['f_xy'][geo_df['comp_grid_id'].values])
-#        else:
-#            geo_df = self.comp_grid
-#            geo_df['spatial_log_intensity'] = parameters["f_xy"]
-#            geo_df = geo_df.sjoin(self.A,how='inner')
-#            geo_df['area'] = 1/self.args['n_xy']**2
-#        f_t = parameters['f_t']
-#        f_a = parameters['f_a']
-#        a_0 = parameters['a_0']
-#        t_lat = np.arange(0,self.args['T'],self.args['T']/self.args['n_t'])
-#        sp_samp = list()
-#        t_samp = list()
-#        # duration of each bin in days
-#        dt = self.T / self.args['T']
-#        for i in range(self.args['T']):
-#            t_i = i * dt
-#            t_in_year = (t_i + self.args['offset_seasonal']) % self.S
-#            a_i = int((t_in_year / self.S) * self.args['n_s'])
-#            geo_df['log_intensity'] = geo_df['spatial_log_intensity'] + a_0 + f_t[i] + f_a[a_i]
-#            sp_samp.append(self._sim_spatial(geo_df))
-#            t_samp.append(np.random.uniform(size=len(sp_samp[-1]))+t_lat[i])
-#        sp = np.hstack([(p.x,p.y) for p in sp_samp])
-#        bg = np.append(sp.T,np.hstack(t_samp).reshape(-1,1),1)
-#        return bg
-
     def _sim_cox(self, parameters):
-        # Spatial log intensity setup
+        """Exact sampler for the factorized Cox background, in internal units.
+
+        mu(t,s) = g(t) h(s); N ~ Poisson(Ig*Ih); times ~ g/Ig via inverse CDF on a fine
+        internal-time grid; locations ~ h*area/Ih via cell multinomial + uniform-in-cell.
+        Uses the same seasonal mapping sigma(t) as the likelihood integral.
+        Returns np.array [N, 3] of (X_real, Y_real, T_internal).
+        """
+        n_t, T_int = self.args['n_t'], self.args['T']
+        # --- fine internal-time grid: resolve seasonal cells (>=4 points per seasonal cell)
+        seasonal_cells_in_window = self.T / self.S * self.args['n_s']
+        refine = max(1, int(np.ceil(4.0 * seasonal_cells_in_window / n_t)))
+        m = n_t * refine
+        dt = T_int / m
+        t_lo = np.arange(m) * dt
+        t_mid_days = (t_lo + dt/2) * (self.T / T_int)
+        a_mid = ((t_mid_days + self.args['offset_seasonal']) % self.S) / self.S * self.args['S']
+        a_idx = np.searchsorted(np.asarray(self.args['x_a']), a_mid, side='right') - 1
+        lt_idx = np.minimum((t_lo / T_int * n_t).astype(int), n_t - 1)
+        f_t = np.asarray(parameters['f_t']); f_a = np.asarray(parameters['f_a'])
+        g = np.exp(float(parameters['a_0']) + f_t[lt_idx] + f_a[a_idx])
+        Ig = g.sum() * dt
+        # --- spatial profile on the model's own grid (copy: no shared-state mutation)
         if 'spatial_cov' in self.args:
-            geo_df = self.args['int_df']
-            geo_df['spatial_log_intensity'] = (
-                parameters['b_0'][geo_df['cov_ind'].values] +
-                parameters['f_xy'][geo_df['comp_grid_id'].values]
-            )
+            geo_df = self.args['int_df'].copy()
+            log_h = (np.asarray(parameters['b_0'])[geo_df['cov_ind'].values]
+                     + np.asarray(parameters['f_xy'])[geo_df['comp_grid_id'].values])
+            area = geo_df['area'].values
         else:
-            geo_df = self.comp_grid
-            geo_df['spatial_log_intensity'] = parameters["f_xy"]
-            geo_df = geo_df.sjoin(self.A, how='inner')
-            geo_df['area'] = 1 / self.args['n_xy']**2
-
-        # Parameter unpacking
-        f_t = parameters['f_t']  # Long-term temporal trend
-        f_a = parameters['f_a']  # Seasonal trend
-        a_0 = parameters['a_0']  # Global intercept
-
-        # Time setup
-        total_time = self.T         # Total time duration (e.g. in days)
-        n_t = self.args['T']        # Number of long-term bins
-        S = self.S                  # Length of seasonal period (e.g. 365 for 1 year)
-        n_s = self.args['n_s']      # Number of seasonal bins per year
-
-        # Finer seasonal binning: number of years × seasonal bins per year
-        n_years = int(total_time / S)
-        n_seasonal_bins = n_years * n_s
-        dt = S / n_s                # Duration of each seasonal bin
-        t_lat = np.arange(0, total_time, dt)
-
-        sp_samp = list()
-        t_samp = list()
-
-        for i in range(n_seasonal_bins):
-            t_i = i * dt
-            # Seasonal bin index within a year
-            a_i = i % n_s
-            # Corresponding coarse long-term bin index
-            lt_i = int((t_i / total_time) * n_t)
-
-            # Add offset for seasonal effect
-            t_in_year = (t_i + self.args['offset_seasonal']) % S
-            a_i = int((t_in_year / S) * n_s)
-
-            # Total log intensity
-            geo_df['log_intensity'] = (
-                geo_df['spatial_log_intensity'] +
-                a_0 +
-                f_t[lt_i] +
-                f_a[a_i]
-            )
-
-            # Simulate spatial pattern
-            sp_samp.append(self._sim_spatial(geo_df))
-            # Simulate event times within bin
-            t_samp.append(np.random.uniform(size=len(sp_samp[-1])) + t_lat[i])
-
-        # Stack results
-        sp = np.hstack([(p.x, p.y) for p in sp_samp])
-        bg = np.append(sp.T, np.hstack(t_samp).reshape(-1, 1), axis=1)
-        return bg
+            geo_df = self.comp_grid.sjoin(self.A[['geometry']], how='inner').copy()
+            log_h = np.asarray(parameters['f_xy'])[geo_df['comp_grid_id'].values]
+            area = np.full(len(geo_df), 1.0 / self.args['n_xy']**2)
+        h_mass = np.exp(log_h) * area
+        Ih = h_mass.sum()
+        # --- exact two-step draw
+        N = np.random.poisson(Ig * Ih)
+        if N == 0:
+            return np.empty((0, 3))
+        cdf = np.cumsum(g / g.sum())
+        bins = np.searchsorted(cdf, np.random.uniform(size=N), side='right')
+        times = t_lo[bins] + np.random.uniform(size=N) * dt
+        cells = np.random.choice(len(h_mass), size=N, p=h_mass / Ih)
+        counts = np.bincount(cells, minlength=len(h_mass))
+        nz = counts > 0
+        pts = geo_df[nz].sample_points(size=counts[nz]).explode(index_parts=False)
+        xy = np.stack((pts.x.values, pts.y.values), axis=1)
+        # times and locations are independent given the factorization: pairing is arbitrary
+        return np.column_stack((xy, times[:len(xy)]))
 
 
     def set_window(self, window, spatial_window=None):
@@ -1731,6 +1688,10 @@ class Hawkes_Model(Point_Process_Model):
                 sp_dif = (self.args['A_'][:,1]-self.args['A_'][:,0])*\
                             self.args['sp_trig'].simulate_trigger(par)
                 t_dif = [self.args['t_trig'].simulate_trigger(par)]
+                # window-consistent thinning: match the truncated-kernel likelihood
+                # (Poisson(alpha) parents thinned by F(w) => expected offspring alpha*F(w))
+                if t_dif[0] > self.args['window']:
+                    continue
                 bg = np.concatenate((bg,[bg[i]+np.append(sp_dif,t_dif)]))
             i += 1
         return bg
@@ -1744,7 +1705,7 @@ class Hawkes_Model(Point_Process_Model):
             Parameters to simulate from. If parameters is None, use mean of posterior samples. keys are string parameter names. values are np.array or float. Names must be same as those that appear in the sample from the model.
         Returns
         -------
-            geopandas DataFrame: ['X','Y','T','A'] columns
+            geopandas DataFrame: ['X','Y','T'] columns (real units)
                 simulated data
         """
         if parameters is None:
@@ -1778,9 +1739,8 @@ class Hawkes_Model(Point_Process_Model):
         points = gpd.GeoDataFrame(data=sample,geometry=geometry,columns=['X','Y','T'])
         #filter to time window
         points['T'] = (points['T']*self.T/self.args['T'])
-        points['A'] = ((points['T']*self.args['T'] + self.args['offset_seasonal']) % self.S)
         #filter to spatial window
-        return points.sjoin(self.A[['geometry']])[['X','Y','T','A','geometry']]
+        return points.sjoin(self.A[['geometry']])[['X','Y','T','geometry']]
 
 
     def plot_day_effect(self):
@@ -1889,7 +1849,7 @@ class LGCP_Model(Point_Process_Model):
             Parameters to simulate from. If parameters is None, use mean of posterior samples. keys are string parameter names. values are np.array or float. Names must be same as those that appear in the sample from the model.
         Returns
         -------
-            geopandas DataFrame: ['X','Y','T'] columns
+            geopandas DataFrame: ['X','Y','T'] columns (real units)
                 simulated data
         """
         if parameters is None:
@@ -1898,8 +1858,5 @@ class LGCP_Model(Point_Process_Model):
         geometry = gpd.points_from_xy(sample.T[0], sample.T[1],crs=self.A.crs)
         points = gpd.GeoDataFrame(data=sample,geometry=geometry,columns=['X','Y','T'])
         points['T'] = (points['T']*self.T/self.args['T'])
-        #points['A'] = (((points['T']/self.args['T']) * self.T + self.args['offset_seasonal']) % 365)
-        #points['A'] = (points['T'] + self.args['offset_seasonal']) % self.S
-        points['A'] = ((points['T']*self.args['T'] + self.args['offset_seasonal']) % self.S)
 
         return points
