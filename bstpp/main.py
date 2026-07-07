@@ -130,7 +130,7 @@ def add_month_grid_and_labels(ax, start_date, num_days,label_every_n_months=3):
 
 class Point_Process_Model:
     def __init__(self,model,data,A,T,offset_seasonal=0,spatial_cov=None,cov_names=None,
-                 cov_grid_size=None,standardize_cov=True,**kwargs):
+                 cov_grid_size=None,standardize_cov=True,sp_var_mu=2.0,**kwargs):
         """
         Spatiotemporal Point Process Model.
         The data is rescaled to fit in a 1x1 spatial grid and a lenght 50 time window. Posterior samples must be interpreted with this in mind.
@@ -162,6 +162,14 @@ class Point_Process_Model:
             Spatial covariate grid (width, height).
         standardize_cov: bool
             Standardize covariates
+        sp_var_mu: float
+            Fixed log-amplitude multiplier applied to the spatial VAE decoder output.
+            Calibrate as sp_var_mu = 0.5*log(sigma2_target / E[f^2]_decoder), where
+            E[f^2]_decoder is the empirical second moment of decoder outputs under z~N(0,I)
+            and sigma2_target is the intended marginal variance of the spatial log-intensity
+            field. Note this is an amplitude multiplier, NOT the var_loc used in VAE
+            training. A sampled amplitude (and a matching knob for the seasonal field, which
+            currently has none) is planned follow-up work.
         priors: dict
             priors for parameters (a_0,w,alpha,beta,sigmax_2). Must be a numpyro distribution.
         """
@@ -332,7 +340,7 @@ class Point_Process_Model:
         default_priors = {}
         if 'num_cov' in args:
             default_priors["w"] = dist.Normal(jnp.zeros(args['num_cov']),jnp.ones(args["num_cov"]))
-        args['sp_var_mu'] = 2.0
+        args['sp_var_mu'] = float(sp_var_mu)
         for par, prior in kwargs.items():
             if isinstance(prior,dist.Distribution):
                 default_priors[par] = prior
@@ -1377,6 +1385,9 @@ class Hawkes_Model(Point_Process_Model):
             (the [0, 1] square). KNOWN APPROXIMATION: this truncates pairs spatially WITHOUT
             a matching truncation of the spatial integral, so it does not yield an exact
             likelihood; leave it None for calibration/SBC work. Defaults to None.
+        sp_var_mu: float
+            Fixed log-amplitude multiplier applied to the spatial VAE decoder output; see
+            Point_Process_Model for calibration guidance. Default 2.0.
         kwargs: dict
             parameters from Point_Process_Model
         """
@@ -1806,6 +1817,9 @@ class LGCP_Model(Point_Process_Model):
         ----------
         args: list
             Parameters from Point_Process_Model
+        sp_var_mu: float
+            Fixed log-amplitude multiplier applied to the spatial VAE decoder output; see
+            Point_Process_Model for calibration guidance. Default 2.0.
         kwargs: dict
             Parameters from Point_Process_Model
         """
