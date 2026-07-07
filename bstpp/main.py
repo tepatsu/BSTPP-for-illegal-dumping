@@ -140,11 +140,18 @@ class Point_Process_Model:
         model: str
             one of ['cox_hawkes','lgcp','hawkes'].
         data: str or pd.DataFrame
-            either file path or DataFrame containing spatiotemporal data. Columns must include 'X', 'Y', 'T'.
+            either file path or DataFrame containing spatiotemporal data. Required
+            columns are 'X', 'Y', 'T'. The seasonal coordinate 'A' (day-of-year) is
+            NOT required: it is derived as (T + offset_seasonal) mod S. If an 'A'
+            column is supplied it is validated for consistency with 'T' (to within
+            1 day) and a ValueError is raised on mismatch, rather than trusted.
         A: np.array [2x2], GeoDataFram
             Spatial region of interest. If np.array first row is the x-range, second row is y-range.
         T: float
             Maximum time in region of interest. Time is assumed to spart at 0.
+        offset_seasonal: float
+            Day-of-year corresponding to T=0, used to derive the seasonal coordinate
+            A = (T_days + offset_seasonal) mod S. Defaults to 0.
         spatial_cov: str,pd.DataFrame,gpd.GeoDataFrame
             Either file path (.csv or .shp), DataFrame, or GeoDataFrame containing spatial covariates.
             Spatial covariates must cover all the points in data.
@@ -446,7 +453,14 @@ class Point_Process_Model:
         args["t_events"]=t_events_total
         args['indices_t']=np.searchsorted(args['x_t'], t_events_total, side='right')-1
 
-        a_events_total=data['A'].values/self.S*args["n_s"]
+        a_days = (data['T'].values + args['offset_seasonal']) % self.S
+        if 'A' in data.columns:
+            supplied = np.asarray(data['A'].values, dtype=float) % self.S
+            if not np.allclose(supplied, a_days, atol=1.0):
+                raise ValueError(
+                    "'A' column is inconsistent with 'T' + offset_seasonal "
+                    "(tolerance 1 day). Drop 'A' or fix offset_seasonal.")
+        a_events_total = a_days/self.S*args["n_s"]
         args["a_events"]=a_events_total
         args['indices_a']=np.searchsorted(args['x_a'], a_events_total, side='right')-1
 
