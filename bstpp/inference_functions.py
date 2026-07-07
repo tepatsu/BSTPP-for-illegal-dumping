@@ -255,11 +255,11 @@ def spatiotemporal_LGCP_model(args):
     Itot_xy=numpyro.deterministic("Itot_xy", spatial_integral)
 
 
-    #loglik=jnp.sum(f_t_i+f_xy_i+a_0)
-    loglik=jnp.sum(f_a + f_t + 
-    _i + a_0)
-    I_tot_txy=numpyro.deterministic("I_tot_txy",Itot_xy * Itot_t * Itot_a)
-    loglik-=I_tot_txy
+    f_t_i = f_t[args["indices_t"]]
+    f_a_i = f_a[args["indices_a"]]
+    loglik = jnp.sum(a_0 + f_t_i + f_a_i + f_xy_i)
+    Itot_txy=numpyro.deterministic("Itot_txy",Itot_xy * Itot_t * Itot_a)
+    loglik-=Itot_txy
     numpyro.deterministic("loglik",loglik)
 
     numpyro.factor("loglik_factor", loglik)
