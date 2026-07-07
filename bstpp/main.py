@@ -1305,34 +1305,12 @@ class Point_Process_Model:
         return bg
 
 
-    def build_hawkes_design(
-        self, coords, t_vals, x_vals, y_vals, n_events
-    ):
-        """
-        coords: (M, 2) array of (i, j)
-        t_vals, x_vals, y_vals: (M,)
-        """
-        hawkes_i = jnp.asarray(coords[:, 0], dtype=jnp.int32)
-        hawkes_dt = jnp.asarray(t_vals)
-        hawkes_dx = jnp.asarray(x_vals)
-        hawkes_dy = jnp.asarray(y_vals)
-
-        return {
-            "hawkes_i": hawkes_i,
-            "hawkes_dt": hawkes_dt,
-            "hawkes_dx": hawkes_dx,
-            "hawkes_dy": hawkes_dy,
-            "n_events": n_events,
-        }
-
-
     def set_window(self, window, spatial_window=None):
         window = float(window)
         if spatial_window is not None:
             spatial_window = float(spatial_window)
         self.args['window'] = window
-        if spatial_window is not None:
-            self.args['spatial_window'] = spatial_window
+        self.args['spatial_window'] = spatial_window
 
         # Recompute pairs with both windows
         coords, t_vals, x_vals, y_vals = aligned_difference_pairs(
@@ -1347,37 +1325,6 @@ class Point_Process_Model:
         self.args['t_vals'] = t_vals
         self.args['x_vals'] = x_vals
         self.args['y_vals'] = y_vals
-
-        n_events = self.args['t_events'].shape[0]
-        self.args['hawkes_design'] = self.build_hawkes_design(
-            coords, t_vals, x_vals, y_vals, n_events
-        )
-
-        if 'litter_t_events' in self.args:
-            litter_diff_coords, litter_diff_t_vals, litter_diff_x_vals, litter_diff_y_vals = aligned_difference_cross(
-                self.args['litter_t_events'],
-                self.args['litter_xy_events'][0],
-                self.args['litter_xy_events'][1],
-                self.args['t_vals'], self.args['x_vals'], self.args['y_vals'],
-                self.args['window'], spatial_window=self.args['spatial_window']
-            )
-            n_litter_events = self.args['litter_t_events'].shape[0]
-            self.args['litter_hawkes_design'] = self.build_hawkes_design(
-                litter_diff_coords, litter_diff_t_vals, litter_diff_x_vals, litter_diff_y_vals, n_litter_events
-            )
-
-        if 'dumping_report_t_events' in self.args:
-            dumping_diff_coords, dumping_diff_t_vals, dumping_diff_x_vals, dumping_diff_y_vals = aligned_difference_cross(
-                self.args['dumping_report_t_events'],
-                self.args['dumping_report_xy_events'][0],
-                self.args['dumping_report_xy_events'][1],
-                self.args['t_vals'], self.args['x_vals'], self.args['y_vals'],
-                self.args['window'], spatial_window=self.args['spatial_window']
-            )
-            n_dumping_report_events = self.args['dumping_report_t_events'].shape[0]
-            self.args['dumping_report_hawkes_design'] = self.build_hawkes_design(
-                dumping_diff_coords, dumping_diff_t_vals, dumping_diff_x_vals, dumping_diff_y_vals, n_dumping_report_events
-            )
 
 
 
