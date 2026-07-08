@@ -1241,13 +1241,27 @@ class Point_Process_Model:
         samples = geo_df[mask_zero].sample_points(size=num_samp[mask_zero])
         return samples.explode(index_parts=False)
 
-    def _sim_cox(self, parameters):
+    def _sim_cox(self, parameters, rng=None):
         """Exact sampler for the factorized Cox background, in internal units.
 
         mu(t,s) = g(t) h(s); N ~ Poisson(Ig*Ih); times ~ g/Ig via inverse CDF on the SAME
         coarse n_t time grid the likelihood integrates on (args['season_idx_of_t']);
         locations ~ h*area/Ih via cell multinomial + uniform-in-cell.
         Returns np.array [N, 3] of (X_real, Y_real, T_internal).
+
+        rng: numpy.random.Generator, optional
+            Used for the spatial GeoSeries.sample_points draw, which ignores numpy's legacy
+            global seed; the Poisson / inverse-CDF / multinomial draws use np.random, so seed
+            those with np.random.seed(...). Provide both for a fully reproducible draw.
+
+        Known approximations (all vanish for a rectangle domain -- use a rectangle A for
+        simulate-and-recover / SBC):
+          - spatial_window truncation is intentionally NOT mirrored in offspring thinning;
+            the spatial excitation integral is left untruncated by design, so keep
+            spatial_window=None for calibration work.
+          - For a GeoDataFrame domain, boundary cells are sampled over the FULL cell and then
+            clipped by simulate()'s A-filter, and the excitation compensator integrates over
+            the bounding rectangle A_ rather than the polygon.
         """
         n_t, T_int = self.args['n_t'], self.args['T']
         # --- coarse n_t time grid: IDENTICAL discretization to the likelihood's time
@@ -1281,7 +1295,7 @@ class Point_Process_Model:
         cells = np.random.choice(len(h_mass), size=N, p=h_mass / Ih)
         counts = np.bincount(cells, minlength=len(h_mass))
         nz = counts > 0
-        pts = geo_df[nz].sample_points(size=counts[nz]).explode(index_parts=False)
+        pts = geo_df[nz].sample_points(size=counts[nz], rng=rng).explode(index_parts=False)
         xy = np.stack((pts.x.values, pts.y.values), axis=1)
         # times and locations are independent given the factorization: pairing is arbitrary
         if len(xy) != len(times):
@@ -1705,13 +1719,16 @@ class Hawkes_Model(Point_Process_Model):
             i += 1
         return bg
 
-    def simulate(self,parameters=None):
+    def simulate(self,parameters=None,rng=None):
         """
         Simulate data from mean posterior parameters.
         Parameters
         ----------
         parameters: dict
             Parameters to simulate from. If parameters is None, use mean of posterior samples. keys are string parameter names. values are np.array or float. Names must be same as those that appear in the sample from the model.
+        rng: numpy.random.Generator, optional
+            Reproducible spatial sampling; passed through to _sim_cox.sample_points. Seed the
+            Poisson/CDF draws separately with np.random.seed(...). See _sim_cox.
         Returns
         -------
             geopandas DataFrame: ['X','Y','T'] columns (real units)
@@ -1738,7 +1755,7 @@ class Hawkes_Model(Point_Process_Model):
             parameters['b_0'] = self.args['spatial_cov'] @ parameters['w']
 
         if self.args['model'] == 'cox_hawkes':
-            bg = self._sim_cox(parameters)
+            bg = self._sim_cox(parameters, rng=rng)
         else:
             bg = self._sim_hawkes_bg(parameters)
         sample = self._sim_offspring(bg,parameters)
@@ -1855,13 +1872,16 @@ class LGCP_Model(Point_Process_Model):
         # under the same convention are meaningful.
         return pars
 
-    def simulate(self,parameters=None):
+    def simulate(self,parameters=None,rng=None):
         """
         Simulate data from mean posterior parameters. Requires model inference.
         Parameters
         ----------
         parameters: dict
             Parameters to simulate from. If parameters is None, use mean of posterior samples. keys are string parameter names. values are np.array or float. Names must be same as those that appear in the sample from the model.
+        rng: numpy.random.Generator, optional
+            Reproducible spatial sampling; passed through to _sim_cox.sample_points. Seed the
+            Poisson/CDF draws separately with np.random.seed(...). See _sim_cox.
         Returns
         -------
             geopandas DataFrame: ['X','Y','T'] columns (real units)
@@ -1869,7 +1889,7 @@ class LGCP_Model(Point_Process_Model):
         """
         if parameters is None:
             parameters = {k:np.array(v).mean(axis=0) for k,v in self.samples.items()}
-        sample = self._sim_cox(parameters)
+        sample = self._sim_cox(parameters, rng=rng)
         geometry = gpd.points_from_xy(sample.T[0], sample.T[1],crs=self.A.crs)
         points = gpd.GeoDataFrame(data=sample,geometry=geometry,columns=['X','Y','T'])
         points['T'] = (points['T']*self.T/self.args['T'])
