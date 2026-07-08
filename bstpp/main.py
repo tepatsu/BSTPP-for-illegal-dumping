@@ -1244,24 +1244,20 @@ class Point_Process_Model:
     def _sim_cox(self, parameters):
         """Exact sampler for the factorized Cox background, in internal units.
 
-        mu(t,s) = g(t) h(s); N ~ Poisson(Ig*Ih); times ~ g/Ig via inverse CDF on a fine
-        internal-time grid; locations ~ h*area/Ih via cell multinomial + uniform-in-cell.
-        Uses the same seasonal mapping sigma(t) as the likelihood integral.
+        mu(t,s) = g(t) h(s); N ~ Poisson(Ig*Ih); times ~ g/Ig via inverse CDF on the SAME
+        coarse n_t time grid the likelihood integrates on (args['season_idx_of_t']);
+        locations ~ h*area/Ih via cell multinomial + uniform-in-cell.
         Returns np.array [N, 3] of (X_real, Y_real, T_internal).
         """
         n_t, T_int = self.args['n_t'], self.args['T']
-        # --- fine internal-time grid: resolve seasonal cells (>=4 points per seasonal cell)
-        seasonal_cells_in_window = self.T / self.S * self.args['n_s']
-        refine = max(1, int(np.ceil(4.0 * seasonal_cells_in_window / n_t)))
-        m = n_t * refine
-        dt = T_int / m
+        # --- coarse n_t time grid: IDENTICAL discretization to the likelihood's time
+        # integral (rate_time = exp(a_0 + f_t + f_a[season_idx_of_t])), so Ig == Itot_time
+        # to float precision. Any future refinement of the integration grid must change the
+        # likelihood integral and this sampler in the SAME commit.
+        m, dt = n_t, T_int / n_t
         t_lo = np.arange(m) * dt
-        t_mid_days = (t_lo + dt/2) * (self.T / T_int)
-        a_mid = ((t_mid_days + self.args['offset_seasonal']) % self.S) / self.S * self.args['S']
-        a_idx = np.searchsorted(np.asarray(self.args['x_a']), a_mid, side='right') - 1
-        lt_idx = np.minimum((t_lo / T_int * n_t).astype(int), n_t - 1)
-        f_t = np.asarray(parameters['f_t']); f_a = np.asarray(parameters['f_a'])
-        g = np.exp(float(parameters['a_0']) + f_t[lt_idx] + f_a[a_idx])
+        g = np.exp(float(parameters['a_0']) + np.asarray(parameters['f_t'])
+                   + np.asarray(parameters['f_a'])[np.asarray(self.args['season_idx_of_t'])])
         Ig = g.sum() * dt
         # --- spatial profile on the model's own grid (copy: no shared-state mutation)
         if 'spatial_cov' in self.args:
@@ -1288,7 +1284,10 @@ class Point_Process_Model:
         pts = geo_df[nz].sample_points(size=counts[nz]).explode(index_parts=False)
         xy = np.stack((pts.x.values, pts.y.values), axis=1)
         # times and locations are independent given the factorization: pairing is arbitrary
-        return np.column_stack((xy, times[:len(xy)]))
+        if len(xy) != len(times):
+            raise RuntimeError(f"sample_points returned {len(xy)} points for "
+                               f"{len(times)} requested; refusing to truncate")
+        return np.column_stack((xy, times))
 
 
     def set_window(self, window, spatial_window=None):
