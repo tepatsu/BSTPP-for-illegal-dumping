@@ -1,0 +1,145 @@
+"""Smoke tests pinning the audit fixes. Each test maps to a prior fix:
+
+- test_single_factor_site      -> duplicate likelihood factor removed (one factor/model)
+- test_*_traces                -> LGCP loglik repair, b_0 site, models construct + finite loglik
+- test_window_default          -> window/coords constructor fix + excitation-integral truncation
+- test_A_derivation            -> seasonal coord A derived from T; supplied A validated
+- test_simulate_runs           -> _sim_offspring range() fix, reversed uniform bounds, no 'A', full window
+
+Everything is seeded. Cox/LGCP tests skip with a clear message if the seasonal
+decoder artifact is missing.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root -> import bstpp
+
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import box
+import jax
+import numpyro.distributions as dist
+from numpyro import handlers
+import pytest
+
+import bstpp
+from bstpp.main import Hawkes_Model, LGCP_Model
+
+# --- seasonal decoder presence -> skip marker for cox/lgcp tests ---
+_SEASONAL_DECODER = os.path.join(os.path.dirname(bstpp.__file__), "decoders", "decoder_1d_T24_circ_small_l8")
+HAS_SEASONAL_DECODER = os.path.isfile(_SEASONAL_DECODER)
+needs_decoder = pytest.mark.skipif(
+    not HAS_SEASONAL_DECODER,
+    reason="seasonal decoder artifact 'bstpp/decoders/decoder_1d_T24_circ_small_l8' is absent",
+)
+
+# --- synthetic dataset: ~60 events, unit square, T ascending over ~2.5 years, NO 'A' column ---
+T_DAYS = 2.5 * 365.0  # 912.5 -> a partial final year exists
+_rng = np.random.RandomState(0)
+_N = 60
+DATA = pd.DataFrame({
+    "X": _rng.uniform(0.05, 0.95, _N),
+    "Y": _rng.uniform(0.05, 0.95, _N),
+    "T": np.sort(_rng.uniform(0, T_DAYS, _N)),
+})
+A_RECT = np.array([[0.0, 1.0], [0.0, 1.0]])          # rectangle spec (fast, for trace tests)
+A_GDF = gpd.GeoDataFrame({"geometry": [box(0, 0, 1, 1)]})  # single polygon (clean sjoin for simulate)
+PRIORS = dict(a_0=dist.Normal(0, 5), alpha=dist.Beta(2, 2),
+              beta=dist.HalfNormal(1.0), sigmax_2=dist.HalfNormal(0.25))
+
+
+def make_hawkes(cox, A=A_RECT, **extra):
+    return Hawkes_Model(DATA, A, T_DAYS, cox_background=cox, **PRIORS, **extra)
+
+
+def make_lgcp(A=A_RECT):
+    return LGCP_Model(DATA, A, T_DAYS, a_0=dist.Normal(0, 5))
+
+
+def _trace(model):
+    return handlers.trace(handlers.seed(model.model, jax.random.PRNGKey(0))).get_trace(model.args)
+
+
+def _factor_sites(tr):
+    return [n for n, s in tr.items() if s.get("type") == "sample" and type(s["fn"]).__name__ == "Unit"]
+
+
+def _loglik(tr):
+    return float(np.asarray(tr["loglik"]["value"]))
+
+
+# ---- duplicate-factor fix: exactly one factor site per model ----
+def test_single_factor_site():
+    tr = _trace(make_hawkes(cox=False))
+    assert _factor_sites(tr) == ["loglik_factor"]
+
+
+# ---- models construct and trace with finite loglik ----
+def test_hawkes_traces():
+    tr = _trace(make_hawkes(cox=False))
+    assert np.isfinite(_loglik(tr))
+
+
+@needs_decoder
+def test_cox_hawkes_traces():
+    tr = _trace(make_hawkes(cox=True))
+    assert np.isfinite(_loglik(tr))
+
+
+@needs_decoder
+def test_lgcp_traces():
+    tr = _trace(make_lgcp())
+    assert np.isfinite(_loglik(tr))
+
+
+# ---- window/coords constructor fix + excitation-integral truncation ----
+def test_window_default():
+    m = make_hawkes(cox=False)                 # no window kwarg -> no KeyError
+    assert "coords" in m.args
+
+    def excite(window):
+        mm = make_hawkes(cox=False, window=window)
+        return float(np.asarray(_trace(mm)["Itot_excite"]["value"]))
+
+    Ie_default = excite(None)                  # default window == T
+    Ie_untrunc = excite(1e9)                   # explicitly untruncated
+    Ie_small = excite(2.0)                      # truncated
+    assert abs(Ie_default - Ie_untrunc) < 1e-6  # default matches the full integral
+    assert Ie_small < Ie_default                # truncation strictly decreases it
+
+
+# ---- seasonal coord A derived from T; supplied A validated ----
+def test_A_derivation():
+    m = make_hawkes(cox=False)                 # DATA has no 'A' -> fit path works
+    assert "a_events" in m.args
+    bad = DATA.copy()
+    bad["A"] = (DATA["T"].values + 100.0) % 365.0   # inconsistent with T
+    with pytest.raises(ValueError):
+        Hawkes_Model(bad, A_RECT, T_DAYS, cox_background=False, **PRIORS)
+
+
+# ---- simulation fixes: range() offspring, correct uniform bounds, no 'A', full window ----
+def test_simulate_runs():
+    m = make_hawkes(cox=False, A=A_GDF)
+
+    # _sim_offspring must iterate (range regression), not crash on a scalar Poisson draw
+    np.random.seed(0)
+    bg = np.array([[0.5, 0.5, 10.0], [0.3, 0.7, 20.0], [0.6, 0.4, 30.0]])
+    off = m._sim_offspring(bg.copy(), {"alpha": 0.3, "beta": 1.0, "sigmax_2": 0.25})
+    assert off.ndim == 2 and off.shape[1] == 3
+
+    # full simulate: X,Y,T only, all T in [0, T_DAYS], events in the final partial year
+    np.random.seed(1)
+    params = {"a_0": 2.0, "f_t": np.zeros(m.args["n_t"]), "f_a": np.zeros(m.args["n_s"]),
+              "f_xy": np.zeros(m.args["n_xy"] ** 2), "alpha": 0.05, "beta": 1.0, "sigmax_2": 0.25}
+    sim = m.simulate(params)
+    assert "A" not in sim.columns
+    assert {"X", "Y", "T"}.issubset(sim.columns)
+    Tr = sim["T"].values
+    assert (Tr >= 0).all() and (Tr <= T_DAYS + 1e-6).all()
+    assert (Tr > 2 * 365.0).any()              # events in the 2.0-2.5 year partial window
